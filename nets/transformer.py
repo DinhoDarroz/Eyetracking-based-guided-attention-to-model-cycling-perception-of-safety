@@ -140,11 +140,19 @@ class Transformer(nn.Module):
         self.feat_norm = nn.LayerNorm(self.feat_dim)
         self.pair_norm = nn.LayerNorm(self.feat_dim * 2)
 
+        # ------------------------------------------------------------------
+        # Ranking head:
+        #   feat_dim -> 4096 -> 1
+        # ------------------------------------------------------------------
         self.rank_fc_1 = nn.Linear(self.feat_dim, 4096)
         self.rank_relu = nn.ReLU()
         self.rank_drop = nn.Dropout(self.rank_dropout)
         self.rank_fc_out = nn.Linear(4096, 1)
-
+        
+        # ------------------------------------------------------------------
+        # Cross-branch classification head:
+        #   [feat_L || feat_R] -> 512 -> 512 -> num_classes
+        # ------------------------------------------------------------------
         self.cross_fc_1 = nn.Linear(self.feat_dim * 2, 512)
         self.cross_relu_1 = nn.ReLU()
         self.cross_drop_1 = nn.Dropout(self.cross_dropout)
