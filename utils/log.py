@@ -68,10 +68,20 @@ def _init_wandb_summary_keys() -> None:
         "accuracy_test_at_best_val": float("-inf"),
         "epoch_best_val": None,
     }
-
     for k, v in defaults.items():
-        if k not in wandb.summary:
+        # NOTE: Some wandb versions have buggy/odd __contains__ behavior on wandb.summary
+        # (can raise KeyError: 0 during `k in wandb.summary`). Use safe access instead.
+        try:
+            _ = wandb.summary[k]
+        except KeyError:
             wandb.summary[k] = v
+        except Exception:
+            # Extremely defensive: if wandb.summary is in a weird state, do not crash training.
+            try:
+                wandb.summary[k] = v
+            except Exception:
+                pass
+
 
 
 def _mirror_to_wandb_summary(metrics: Dict[str, Any]) -> None:

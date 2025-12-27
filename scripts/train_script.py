@@ -990,20 +990,22 @@ def _make_validation_handler(
         metrics = {
             # Train metrics are taken from the trainer engine metrics accumulated during the epoch.
             "accuracy_train": engine.state.metrics.get("acc"),
-            "loss_train": engine.state.metrics["loss"],
+
         
             # Validation/test metrics come from the evaluator engines (current epoch weights).
             "accuracy_validation": evaluator.state.metrics["acc"],
             "accuracy_test": evaluator_test.state.metrics["acc"],
             "loss_validation": evaluator.state.metrics["loss"],
             "loss_test": evaluator_test.state.metrics["loss"],
+
+            "loss_train": engine.state.metrics["loss"],
         
             # Wall-clock time since training started (string for log consistency).
             "time": f"{timer() - start_training:.3f}",
         
             # Bookkeeping for reproducibility and alignment with logs.
-            "epoch": engine.state.epoch,
-            "iteration": engine.state.iteration,
+            #"epoch": engine.state.epoch,
+            #"iteration": engine.state.iteration,
         
             # -----------------------------
             # Selection-coupled "best" stats
@@ -1018,9 +1020,9 @@ def _make_validation_handler(
             "max_accuracy_test": training_state["test_acc_at_best_val"],
         
             # Explicit names (recommended for thesis clarity).
-            "accuracy_train_at_best_val": training_state["train_acc_at_best_val"],
-            "accuracy_test_at_best_val": training_state["test_acc_at_best_val"],
-            "epoch_best_val": training_state["epoch_best_val"],
+            #"accuracy_train_at_best_val": training_state["train_acc_at_best_val"],
+            #"accuracy_test_at_best_val": training_state["test_acc_at_best_val"],
+            #"epoch_best_val": training_state["epoch_best_val"],
         }
         # RSSCNN exposes an additional classification metric ("c_acc") alongside ranking accuracy.
         if args.model == "rsscnn":
