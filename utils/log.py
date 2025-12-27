@@ -1,12 +1,24 @@
-# log.py
+# utils/log.py
 """
-Central logging utilities for the training pipeline.
+Central logging utilities for console + Weights & Biases (W&B).
 
-This module provides a single entry point `log(args, metrics)` that can:
-  - log to Weights & Biases (W&B) if args.log_wandb is True
-  - print to console if args.log_console is True
+Design policy (important):
+- The TRAINER (train_script.py) is the single source of truth for "best" metrics.
+- This module does NOT decide what "best" means and does NOT recompute best snapshots.
+- It only:
+    1) logs the provided metrics dict to W&B (if enabled),
+    2) mirrors selected keys into wandb.summary for easy dashboard access,
+    3) prints a consistent JSON block to console.
 
-It also maintains "best-so-far" (max) accuracies in `wandb.summary` when W&B is enabled.
+Recommended metric semantics (trainer should provide these):
+- max_accuracy_validation: best validation accuracy so far
+- max_accuracy_train:      train accuracy at the best-val epoch  (selection-coupled)
+- max_accuracy_test:       test accuracy at the best-val epoch   (selection-coupled)
+
+Optional but strongly recommended:
+- epoch_best_val: epoch index where best validation occurred
+- accuracy_train_at_best_val / accuracy_test_at_best_val:
+  explicit names to avoid confusion; if present, we mirror them too.
 """
 
 from __future__ import annotations
@@ -14,21 +26,17 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Optional
 
-import wandb
+try:
+    import wandb  # type: ignore
+except Exception:  # pragma: no cover
+    wandb = None  # type: ignore
 
 
 def _to_float(x: Any, default: Optional[float] = None) -> Optional[float]:
-    """
-    Convert common numeric containers to a Python float.
-
-    Handles:
-      - Python ints/floats
-      - torch tensors / numpy scalars (via .item())
-      - None -> returns default
-    """
-    if x is None:
-        return default
+    """Convert tensors / numpy scalars / numeric-ish values to float safely."""
     try:
+        if x is None:
+            return default
         if hasattr(x, "item"):
             return float(x.item())
         return float(x)
@@ -36,59 +44,89 @@ def _to_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
-def _init_wandb_best_keys() -> None:
-    """
-    Ensure the W&B run summary contains the best-accuracy keys used by this project.
+def _wandb_available() -> bool:
+    """True if wandb is importable and a run is active."""
+    return wandb is not None and getattr(wandb, "run", None) is not None
 
-    This is called on the first epoch that reaches log_wandb(). The keys are initialized
-    to -inf so the first numeric validation accuracy will always be treated as an improvement.
+
+def _init_wandb_summary_keys() -> None:
     """
-    if wandb.run is None:
+    Ensure expected summary keys exist so dashboards don't show missing fields.
+
+    We do NOT set semantics here; these are just placeholders so the keys exist.
+    """
+    if not _wandb_available():
         return
 
-    if "max_accuracy_validation" not in wandb.summary:
-        wandb.summary["max_accuracy_train"] = float("-inf")
-        wandb.summary["max_accuracy_validation"] = float("-inf")
-        wandb.summary["max_accuracy_test"] = float("-inf")
+    # Canonical (legacy) keys used across your project logs / sweeps.
+    defaults = {
+        "max_accuracy_train": float("-inf"),
+        "max_accuracy_validation": float("-inf"),
+        "max_accuracy_test": float("-inf"),
+        # Optional explicit names (recommended for clarity).
+        "accuracy_train_at_best_val": float("-inf"),
+        "accuracy_test_at_best_val": float("-inf"),
+        "epoch_best_val": None,
+    }
+
+    for k, v in defaults.items():
+        if k not in wandb.summary:
+            wandb.summary[k] = v
+
+
+def _mirror_to_wandb_summary(metrics: Dict[str, Any]) -> None:
+    """
+    Mirror best / selection-related values into wandb.summary.
+
+    This function assumes the trainer provides the canonical values.
+    It does not compute or update best values by itself.
+    """
+    if not _wandb_available():
+        return
+
+    # Always initialize once per run.
+    _init_wandb_summary_keys()
+
+    # Backward-compatible "max_*" keys (should represent selection-coupled values).
+    for k in ("max_accuracy_train", "max_accuracy_validation", "max_accuracy_test"):
+        if k in metrics:
+            v = _to_float(metrics.get(k), default=None)
+            if v is not None:
+                wandb.summary[k] = v
+
+    # Explicit names, if the trainer uses them.
+    for k in ("accuracy_train_at_best_val", "accuracy_test_at_best_val"):
+        if k in metrics:
+            v = _to_float(metrics.get(k), default=None)
+            if v is not None:
+                wandb.summary[k] = v
+
+    # Epoch index where the best validation occurred (optional but useful).
+    if "epoch_best_val" in metrics:
+        try:
+            wandb.summary["epoch_best_val"] = int(metrics["epoch_best_val"])
+        except Exception:
+            # Keep whatever is currently there if it cannot be converted.
+            pass
 
 
 def log_wandb(metrics: Dict[str, Any]) -> None:
     """
-    Log metrics to W&B and maintain best-so-far accuracies.
+    Log a metrics dict to Weights & Biases.
 
-    Update rule:
-      - If current validation accuracy improves over summary["max_accuracy_validation"],
-        snapshot train/val/test accuracies into summary max fields.
+    Contract:
+    - metrics is expected to contain scalars / json-serializable values.
+    - This function does not mutate training semantics; it only logs.
 
-    Consistency rule:
-      - Always write the summary best values back into `metrics` so that downstream loggers
-        (console) display the same "max_*" values as W&B.
+    If wandb is not active, this function is a no-op.
     """
-    if wandb.run is None:
-        # Defensive: args.log_wandb might be True but wandb.init() failed / wasn't called.
+    if not _wandb_available():
         return
 
-    _init_wandb_best_keys()
+    # Mirror selection / best values into summary for easy browsing.
+    _mirror_to_wandb_summary(metrics)
 
-    # Convert for safe comparison / storage (tensors, numpy scalars, etc.)
-    acc_train = _to_float(metrics.get("accuracy_train"), default=None)
-    acc_val = _to_float(metrics.get("accuracy_validation"), default=None)
-    acc_test = _to_float(metrics.get("accuracy_test"), default=None)
-
-    best_val = _to_float(wandb.summary.get("max_accuracy_validation"), default=float("-inf"))
-
-    # Update best snapshot only if val accuracy is available and improved.
-    if acc_val is not None and acc_val > best_val:
-        wandb.summary["max_accuracy_train"] = acc_train if acc_train is not None else float("-inf")
-        wandb.summary["max_accuracy_validation"] = acc_val
-        wandb.summary["max_accuracy_test"] = acc_test if acc_test is not None else float("-inf")
-
-    # Reflect best-so-far back into metrics to keep console output aligned with W&B.
-    metrics["max_accuracy_train"] = wandb.summary.get("max_accuracy_train")
-    metrics["max_accuracy_validation"] = wandb.summary.get("max_accuracy_validation")
-    metrics["max_accuracy_test"] = wandb.summary.get("max_accuracy_test")
-
-    # Finally log everything for this epoch.
+    # Log the full metrics payload for time-series plots.
     wandb.log(metrics)
 
 
@@ -96,34 +134,21 @@ def log_console(metrics: Dict[str, Any]) -> None:
     """
     Print metrics to stdout in a consistent, readable format.
 
-    If `metrics["batch"]` exists in the form "cur/total", the "cur" portion is used as the step.
-    Otherwise, `metrics["iteration"]` is used as the step.
+    Step resolution rule:
+    - If metrics["batch"] exists as "cur/total", use "cur" as step.
+    - Else use metrics["iteration"] when available.
     """
     batch_str = metrics.get("batch", None)
-    if batch_str is not None and isinstance(batch_str, str) and "/" in batch_str:
+    if isinstance(batch_str, str) and "/" in batch_str:
         step_str = batch_str.split("/")[0]
     else:
         step_str = metrics.get("iteration", None)
 
     epoch = metrics.get("epoch", None)
+
     if step_str is not None:
         print(f"Results - Epoch: {epoch} - Step: {step_str}")
     else:
         print(f"Results - Epoch: {epoch}")
 
     print(json.dumps(metrics, indent=2, default=str))
-
-
-def log(args, metrics: Dict[str, Any]) -> None:
-    """
-    Main logging entry point called by the training script.
-
-    Order matters:
-      - W&B logging runs first so it can overwrite max_* values inside `metrics`
-        before the console prints the same dict.
-    """
-    if getattr(args, "log_wandb", False):
-        log_wandb(metrics)
-
-    if getattr(args, "log_console", False):
-        log_console(metrics)

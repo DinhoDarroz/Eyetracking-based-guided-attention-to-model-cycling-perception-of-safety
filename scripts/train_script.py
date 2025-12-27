@@ -755,13 +755,13 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
 
 
 def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_idx: int, print_output: bool = True):
-"""
-Computes a confusion matrix adapted to:
-- ties=True  → 3 classes  (0=left, 1=tie, 2=right)
-- ties=False → 2 classes  (0=left, 1=right)
-
-If print_output=False → do NOT print anything (useful for test set).
-"""
+    """
+    Computes a confusion matrix adapted to:
+    - ties=True  → 3 classes  (0=left, 1=tie, 2=right)
+    - ties=False → 2 classes  (0=left, 1=right)
+    
+    If print_output=False → do NOT print anything (useful for test set).
+    """
 
     if args.model not in ["sscnn", "rsscnn"]:
         return None
@@ -913,6 +913,8 @@ def _make_validation_handler(
         engine.state.metrics["val_acc"] = evaluator.state.metrics["acc"]
 
         current_val_acc = float(evaluator.state.metrics["acc"])
+        current_train_acc = engine.state.metrics.get("acc")
+        current_test_acc = evaluator_test.state.metrics.get("acc")
 
         # ---------------------------------------------------------------------
         # 2) Scheduler stepping (only for validation-dependent schedulers)
@@ -933,11 +935,23 @@ def _make_validation_handler(
             )
 
         # ---------------------------------------------------------------------
-        # 3) Track validation accuracy history and best-so-far
+        # 3) Track validation accuracy history and best-so-far (selection-coupled)
         # ---------------------------------------------------------------------
         training_state["val_acc_history"].append(current_val_acc)
-        if current_val_acc > training_state["best_val_acc"]:
+        
+        # IMPORTANT: selection is based on validation only.
+        # When validation improves, snapshot the corresponding train/test accuracies
+        # from THIS SAME epoch (same weights).
+        if current_val_acc > float(training_state["best_val_acc"]):
             training_state["best_val_acc"] = current_val_acc
+            training_state["epoch_best_val"] = int(engine.state.epoch)
+        
+            # Snapshot train/test acc at the best-val epoch (may be None if metric missing)
+            if current_train_acc is not None:
+                training_state["train_acc_at_best_val"] = float(current_train_acc)
+            if current_test_acc is not None:
+                training_state["test_acc_at_best_val"] = float(current_test_acc)
+
 
         # ---------------------------------------------------------------------
         # 4) Optuna integration (report + pruning)
@@ -977,28 +991,37 @@ def _make_validation_handler(
             # Train metrics are taken from the trainer engine metrics accumulated during the epoch.
             "accuracy_train": engine.state.metrics.get("acc"),
             "loss_train": engine.state.metrics["loss"],
-
-            # Validation/test metrics come from the evaluator engines.
+        
+            # Validation/test metrics come from the evaluator engines (current epoch weights).
             "accuracy_validation": evaluator.state.metrics["acc"],
             "accuracy_test": evaluator_test.state.metrics["acc"],
             "loss_validation": evaluator.state.metrics["loss"],
             "loss_test": evaluator_test.state.metrics["loss"],
-
+        
             # Wall-clock time since training started (string for log consistency).
             "time": f"{timer() - start_training:.3f}",
-
+        
             # Bookkeeping for reproducibility and alignment with logs.
             "epoch": engine.state.epoch,
             "iteration": engine.state.iteration,
-
-            # Best validation accuracy observed so far.
+        
+            # -----------------------------
+            # Selection-coupled "best" stats
+            # -----------------------------
+            # Best validation accuracy observed so far (selection criterion).
             "max_accuracy_validation": training_state["best_val_acc"],
-
-            # Placeholders (if best-train/best-test tracking is implemented elsewhere).
-            "max_accuracy_train": None,
-            "max_accuracy_test": None,
+        
+            # Legacy keys (keep for backward compatibility):
+            # These are NOT "max over epochs". They are train/test accuracy
+            # at the epoch where validation was best.
+            "max_accuracy_train": training_state["train_acc_at_best_val"],
+            "max_accuracy_test": training_state["test_acc_at_best_val"],
+        
+            # Explicit names (recommended for thesis clarity).
+            "accuracy_train_at_best_val": training_state["train_acc_at_best_val"],
+            "accuracy_test_at_best_val": training_state["test_acc_at_best_val"],
+            "epoch_best_val": training_state["epoch_best_val"],
         }
-
         # RSSCNN exposes an additional classification metric ("c_acc") alongside ranking accuracy.
         if args.model == "rsscnn":
             metrics.update(
@@ -1073,8 +1096,6 @@ def _make_validation_handler(
 
     return log_validation_results
 
-
-
 # --------------------------------------------------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------------------------------------------------
@@ -1141,10 +1162,14 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
 
     # Centralized state for cross-handler communication and summary statistics.
     # `val_acc_history` supports smoothing and robust final reporting.
-    training_state: Dict[str, float | List[float]] = {
+    training_state: Dict[str, float | List[float] | int | None] = {
         "best_val_acc": 0.0,
+        "train_acc_at_best_val": float("-inf"),
+        "test_acc_at_best_val": float("-inf"),
+        "epoch_best_val": None,
         "val_acc_history": [],
     }
+
 
     # ------------------------------------------------------------------------------------------------
     # Model and optimization setup

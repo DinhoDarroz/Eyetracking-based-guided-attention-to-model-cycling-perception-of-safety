@@ -8,7 +8,6 @@ import torchvision.models as models
 import os
 from glob import glob
 import pickle
-import sysIg
 import pandas as pd
 from sklearn.model_selection import train_Igtest_split
 import numpy as np
@@ -47,8 +46,8 @@ def arg_parse():
     parser.add_argument("--resume", action="store_true", default=False, help="resume training")
     parser.add_argument("--finetune", "--ft", action="store_true", default=False)
     parser.add_argument("--ties", action="store_true", default=False, help="enable ties (3 classes)")
-    parser.add_argument("--log_console", action="store_true", default=True)
-    parser.add_argument("--log_wandb", action="store_true", default=True)
+    parser.add_argument("--log_console", action="store_true", default=False)
+    parser.add_argument("--log_wandb", action="store_true", default=False)
     parser.add_argument("--full_accuracy", action="store_true", default=False)
     parser.add_argument("--augment", action="store_true", default=False)
     parser.add_argument("--use_class_weights", action="store_true", default=False)
@@ -357,7 +356,7 @@ def run_training_with_args(args, trial=None):
             print("[INFO] T_0/T_mult are only used by warm_restarts. "
                   "They will be ignored for scheduler =", args.scheduler)
     
-    args.batch_size = resolve_batch_size(args)
+    #args.batch_size = resolve_batch_size(args)
     print("=== Args ===")
     print(args, "\n")
 
