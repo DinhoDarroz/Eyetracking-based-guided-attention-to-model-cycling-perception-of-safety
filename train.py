@@ -9,13 +9,14 @@ import os
 from glob import glob
 import pickle
 import pandas as pd
-from sklearn.model_selection import train_Igtest_split
+from sklearn.model_selection import train_test_split
 import numpy as np
 import wandb
 from data import ComparisonsDataset, CustomTransform, PairwiseAugmentationPipeline
 from torchvision import transforms
 
 from train_utils import (
+    validate_and_normalize_args,
     build_transformer_backbone,
     compute_class_weights_from_df,
     print_augmentation_plan,
@@ -237,11 +238,11 @@ def read_data(args):
             comparisons_df = comparisons_df[comparisons_df['has_eyetracker']].copy()
             if comparisons_df.empty:
                 print("[WARN] --gaze only: 0 rows with has_eyetracker==True after filtering.")
-
-        elif args.gaze == 'off':
-            comparisons_df = comparisons_df[~comparisons_df['has_eyetracker']].copy()
-            if comparisons_df.empty:
-                print("[WARN] --gaze off: 0 rows with has_eyetracker==False after filtering.")
+        
+        #elif args.gaze == 'off':
+        #    comparisons_df = comparisons_df[~comparisons_df['has_eyetracker']].copy()
+        #    if comparisons_df.empty:
+        #        print("[WARN] --gaze off: 0 rows with has_eyetracker==False after filtering.")
 
     # -------- Labels / ties --------
     if not args.ties:
@@ -332,29 +333,8 @@ def run_training_with_args(args, trial=None):
     Returns best validation accuracy from train().
     """
 
-    # Ensure ties margin default is set
-    if getattr(args, "ranking_margin_ties", None) is None:
-        args.ranking_margin_ties = args.ranking_margin
-
-    # ---- Scheduler sanity checks / friendly warnings ----
-    if args.scheduler == "none":
-        if args.warmup_frac != 0.0:
-            print("[INFO] --scheduler none: ignoring --warmup_frac (no warmup used).")
-
-    if args.scheduler not in ["warmup_cosine", "onecycle"]:
-        if args.warmup_frac != 0.0:
-            print("[INFO] --warmup_frac is only used by warmup_cosine/onecycle. "
-                  "It will be ignored for scheduler =", args.scheduler)
-
-    if args.scheduler not in ["warmup_cosine", "cosine", "warm_restarts"]:
-        if args.eta_min != 1e-6:
-            print("[INFO] --eta_min is only used by warmup_cosine/cosine/warm_restarts. "
-                  "It will be ignored for scheduler =", args.scheduler)
-
-    if args.scheduler != "warm_restarts":
-        if args.T_0 != 10 or args.T_mult != 2:
-            print("[INFO] T_0/T_mult are only used by warm_restarts. "
-                  "They will be ignored for scheduler =", args.scheduler)
+    # Central consistency / dependency checks
+    validate_and_normalize_args(args, strict=False, verbose=True)
     
     #args.batch_size = resolve_batch_size(args)
     print("=== Args ===")
@@ -543,16 +523,12 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # 6) DEVICE & MODEL
     # =============================================================================================== #
+    # Define cpu/gpu device
     if args.cuda:
-        assert torch.cuda.is_available(), (
-            "ERROR: --cuda was passed but CUDA is not available. "
-            "Refusing to fall back to CPU."
-        )
-        device = torch.device(f"cuda:{args.cuda_id}")
+        device = torch.device("cuda:{}".format(args.cuda_id) if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device("cpu")
-    
-    print("Device:", device)
+    print('Device:', device)
     print("Parsing model...")
 
     use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)

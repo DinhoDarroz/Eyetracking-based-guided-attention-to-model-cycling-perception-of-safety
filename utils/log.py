@@ -152,3 +152,16 @@ def log_console(metrics: Dict[str, Any]) -> None:
         print(f"Results - Epoch: {epoch}")
 
     print(json.dumps(metrics, indent=2, default=str))
+
+def log(args, metrics: Dict[str, Any]) -> None:
+    """
+    Main logging entry point called by the training script.
+
+    - W&B logging first (so summary mirroring happens before console print).
+    - Console logging second.
+    """
+    if getattr(args, "log_wandb", False):
+        log_wandb(metrics)
+
+    if getattr(args, "log_console", False):
+        log_console(metrics)

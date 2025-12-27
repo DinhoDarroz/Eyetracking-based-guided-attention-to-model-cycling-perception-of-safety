@@ -21,6 +21,207 @@ import torch
 from torch import nn
 import timm
 
+
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+
+@dataclass
+class ArgsCheckReport:
+    """Report returned by validate_and_normalize_args()."""
+    warnings: List[str]
+    errors: List[str]
+
+
+def _warn(warnings: List[str], msg: str) -> None:
+    warnings.append(msg)
+
+
+def _err(errors: List[str], msg: str) -> None:
+    errors.append(msg)
+
+# =============================================================================================== #
+# Args dependency test
+# =============================================================================================== #
+
+def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True) -> ArgsCheckReport:
+    """
+    Validate and normalize run arguments.
+
+    Goals:
+      1) Normalize dependent defaults (e.g., ranking_margin_ties).
+      2) Warn about arguments that will be ignored due to other settings.
+      3) Catch clearly invalid combinations early (optionally strict).
+
+    Args:
+        args: argparse Namespace
+        strict: if True -> raise ValueError on any detected error
+        verbose: if True -> print warnings/errors
+
+    Returns:
+        ArgsCheckReport(warnings, errors)
+    """
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Basic numeric sanity
+    # ------------------------------------------------------------------
+    if getattr(args, "base_lr", 0.0) <= 0:
+        _err(errors, f"--base_lr must be > 0 (got {getattr(args, 'base_lr', None)})")
+
+    if getattr(args, "weight_decay", 0.0) < 0:
+        _err(errors, f"--weight_decay must be >= 0 (got {getattr(args, 'weight_decay', None)})")
+
+    if getattr(args, "backbone_lr_scale", 0.1) <= 0:
+        _err(errors, f"--backbone_lr_scale must be > 0 (got {getattr(args, 'backbone_lr_scale', None)})")
+
+    if getattr(args, "k", 1) < 1:
+        _err(errors, f"--k (grad accumulation) must be >= 1 (got {getattr(args, 'k', None)})")
+
+    if getattr(args, "grad_clip", 0.0) < 0:
+        _err(errors, f"--grad_clip must be >= 0 (got {getattr(args, 'grad_clip', None)})")
+
+    if getattr(args, "max_epochs", 1) < 1:
+        _err(errors, f"--max_epochs must be >= 1 (got {getattr(args, 'max_epochs', None)})")
+
+    # ------------------------------------------------------------------
+    # Ties margin default (your original check)
+    # ------------------------------------------------------------------
+    if getattr(args, "ranking_margin_ties", None) is None:
+        args.ranking_margin_ties = args.ranking_margin
+
+    # If ties are OFF, ties margin + ties loss weight are irrelevant
+    if not getattr(args, "ties", False):
+        if getattr(args, "ties_w", 0.0) not in (0.0, 0):
+            _warn(warnings, "--ties is OFF, so --ties_w will be ignored.")
+        if getattr(args, "ranking_margin_ties", None) is not None:
+            # It's harmless, but signal it.
+            _warn(warnings, "--ties is OFF, so --ranking_margin_ties will be ignored.")
+
+    # If ties are ON, make sure ties margin is sensible
+    if getattr(args, "ties", False) and getattr(args, "ranking_margin_ties", 0.0) < 0:
+        _err(errors, f"--ranking_margin_ties must be >= 0 when ties are enabled (got {args.ranking_margin_ties}).")
+
+    # ------------------------------------------------------------------
+    # Scheduler sanity checks (your original checks + stronger validation)
+    # ------------------------------------------------------------------
+    scheduler = getattr(args, "scheduler", "warmup_cosine")
+
+    if scheduler == "none":
+        if getattr(args, "warmup_frac", 0.0) != 0.0:
+            _warn(warnings, "[INFO] --scheduler none: ignoring --warmup_frac (no warmup used).")
+        if getattr(args, "eta_min", 1e-6) != 1e-6:
+            _warn(warnings, "[INFO] --scheduler none: ignoring --eta_min (no cosine used).")
+
+    if scheduler not in ["warmup_cosine", "onecycle"]:
+        if getattr(args, "warmup_frac", 0.0) != 0.0:
+            _warn(
+                warnings,
+                "[INFO] --warmup_frac is only used by warmup_cosine/onecycle; "
+                f"it will be ignored for scheduler={scheduler}."
+            )
+
+    if scheduler not in ["warmup_cosine", "cosine", "warm_restarts"]:
+        if getattr(args, "eta_min", 1e-6) != 1e-6:
+            _warn(
+                warnings,
+                "[INFO] --eta_min is only used by warmup_cosine/cosine/warm_restarts; "
+                f"it will be ignored for scheduler={scheduler}."
+            )
+
+    if scheduler != "warm_restarts":
+        if getattr(args, "T_0", 10) != 10 or getattr(args, "T_mult", 2) != 2:
+            _warn(
+                warnings,
+                "[INFO] T_0/T_mult are only used by warm_restarts; "
+                f"they will be ignored for scheduler={scheduler}."
+            )
+
+    # Validate scheduler-specific value ranges
+    warmup_frac = float(getattr(args, "warmup_frac", 0.0))
+    if warmup_frac < 0.0 or warmup_frac > 1.0:
+        _err(errors, f"--warmup_frac must be in [0,1] (got {warmup_frac}).")
+
+    if scheduler == "warm_restarts":
+        if getattr(args, "T_0", 1) < 1:
+            _err(errors, f"--T_0 must be >= 1 for warm_restarts (got {getattr(args, 'T_0', None)}).")
+        if getattr(args, "T_mult", 1) < 1:
+            _err(errors, f"--T_mult must be >= 1 for warm_restarts (got {getattr(args, 'T_mult', None)}).")
+
+    if scheduler in ["warmup_cosine", "cosine", "warm_restarts"]:
+        if getattr(args, "eta_min", 0.0) < 0:
+            _err(errors, f"--eta_min must be >= 0 (got {getattr(args, 'eta_min', None)}).")
+
+    # ------------------------------------------------------------------
+    # Model-type dependencies (important for “ignored args” correctness)
+    # ------------------------------------------------------------------
+    model = getattr(args, "model", "rcnn")
+
+    # Classification-only model ignores ranking-related knobs
+    if model == "sscnn":
+        if getattr(args, "rank_w", 0.0) not in (0.0, 0):
+            _warn(warnings, "--model sscnn: --rank_w is ignored.")
+        if getattr(args, "ties_w", 0.0) not in (0.0, 0):
+            _warn(warnings, "--model sscnn: --ties_w is ignored.")
+        if getattr(args, "ranking_margin", 0.0) != 0.3:
+            _warn(warnings, "--model sscnn: --ranking_margin is ignored.")
+        if getattr(args, "attn_w", 0.0) not in (0.0, 0) and getattr(args, "gaze", "off") != "off":
+            # In your code, SSCNN doesn't return attn maps; gaze KL is not applicable.
+            _warn(warnings, "--model sscnn: gaze alignment loss is not applicable; --attn_w will be ignored.")
+
+    # Ranking-only model ignores classification knobs
+    if model == "rcnn":
+        if getattr(args, "use_class_weights", False):
+            _warn(warnings, "--model rcnn: --use_class_weights is ignored (no CE loss).")
+        if float(getattr(args, "label_smoothing", 0.0)) > 0:
+            _warn(warnings, "--model rcnn: --label_smoothing is ignored (no CE loss).")
+
+    # ------------------------------------------------------------------
+    # Gaze dependencies (consistency with your pipeline behavior)
+    # ------------------------------------------------------------------
+    gaze_mode = getattr(args, "gaze", "use")
+    attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
+
+    if gaze_mode == "off":
+        if attn_w != 0.0:
+            _warn(warnings, "--gaze off: gaze alignment is disabled; setting --attn_w to 0.")
+            args.attn_w = 0.0
+    else:
+        # gaze is on/use/only
+        if attn_w < 0:
+            _err(errors, f"--attn_w must be >= 0 (got {attn_w}).")
+
+        # In your code, gaze alignment only makes sense if the model returns attn maps.
+        # That is true for rcnn/rsscnn when return_attn is enabled.
+        if model not in ("rcnn", "rsscnn") and attn_w > 0:
+            _warn(warnings, f"--gaze {gaze_mode} with --attn_w>0 but model={model}; gaze KL is not used.")
+
+    # ------------------------------------------------------------------
+    # Finetuning dependencies
+    # ------------------------------------------------------------------
+    if not getattr(args, "finetune", False):
+        # num_ft_blocks won’t matter if backbone is frozen
+        if getattr(args, "num_ft_blocks", 1) != 1:
+            _warn(warnings, "--finetune is OFF: --num_ft_blocks is ignored.")
+    else:
+        if getattr(args, "num_ft_blocks", 1) < 1:
+            _err(errors, f"--num_ft_blocks must be >= 1 when finetuning (got {getattr(args, 'num_ft_blocks', None)}).")
+
+    # ------------------------------------------------------------------
+    # Emit + optionally fail
+    # ------------------------------------------------------------------
+    if verbose:
+        for m in warnings:
+            print(m)
+        for e in errors:
+            print("[ERROR]", e)
+
+    if strict and errors:
+        raise ValueError("Argument validation failed:\n" + "\n".join(errors))
+
+    return ArgsCheckReport(warnings=warnings, errors=errors)
+    
 # =============================================================================================== #
 # Backbone factory (DeiT via torch.hub, others via timm)
 # =============================================================================================== #
