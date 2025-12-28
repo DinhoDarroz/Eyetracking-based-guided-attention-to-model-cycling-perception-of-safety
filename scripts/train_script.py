@@ -345,7 +345,7 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
                 lr=base_lr,
                 betas=(0.9, 0.999),
                 eps=1e-8,
-                weight_decay=0.0,
+                weight_decay=1e-3,
             )
 
         # ------------------------------------------------------------------
@@ -1004,8 +1004,8 @@ def _make_validation_handler(
             "time": f"{timer() - start_training:.3f}",
         
             # Bookkeeping for reproducibility and alignment with logs.
-            #"epoch": engine.state.epoch,
-            #"iteration": engine.state.iteration,
+            "epoch": engine.state.epoch,
+            "iteration": engine.state.iteration,
         
             # -----------------------------
             # Selection-coupled "best" stats
@@ -1059,15 +1059,15 @@ def _make_validation_handler(
             should_stop, _ = early_stopper.update(engine.state.epoch, current_value)
 
             # Log early stopping diagnostics for transparency and post-hoc analysis.
-            metrics.update(
-                {
-                    "early_stop/metric": monitor_name,
-                    "early_stop/value": current_value,
-                    "early_stop/best": None if early_stopper.best is None else float(early_stopper.best),
-                    "early_stop/best_epoch": None if early_stopper.best_epoch is None else int(early_stopper.best_epoch),
-                    "early_stop/bad_epochs": int(early_stopper.bad_epochs),
-                }
-            )
+            #metrics.update(
+            #    {
+            #        "early_stop/metric": monitor_name,
+            #        "early_stop/value": current_value,
+            #        "early_stop/best": None if early_stopper.best is None else float(early_stopper.best),
+            #        "early_stop/best_epoch": None if early_stopper.best_epoch is None else int(early_stopper.best_epoch),
+            #        "early_stop/bad_epochs": int(early_stopper.bad_epochs),
+            #    }
+            #)
 
             if should_stop:
                 # Human-readable stop reason for logs and W&B summary.

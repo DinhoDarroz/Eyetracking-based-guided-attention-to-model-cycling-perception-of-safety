@@ -47,7 +47,7 @@ def arg_parse():
     parser.add_argument("--resume", action="store_true", default=False, help="resume training")
     parser.add_argument("--finetune", "--ft", action="store_true", default=False)
     parser.add_argument("--ties", action="store_true", default=False, help="enable ties (3 classes)")
-    parser.add_argument("--log_console", action="store_true", default=False)
+    parser.add_argument("--log_console", action="store_true", default=True)
     parser.add_argument("--log_wandb", action="store_true", default=False)
     parser.add_argument("--full_accuracy", action="store_true", default=False)
     parser.add_argument("--augment", action="store_true", default=False)
@@ -58,7 +58,7 @@ def arg_parse():
     parser.add_argument(
         "--scheduler",
         type=str,
-        default="warmup_cosine",
+        default="none",
         choices=[
             "none",
             "warmup_cosine",
@@ -131,7 +131,7 @@ def arg_parse():
     # -------------------- LR & OPTIMIZATION ------------------
     parser.add_argument("--base_lr", type=float, default=5e-6)
     parser.add_argument("--backbone_lr_scale", type=float, default=0.1)
-    parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=0)
     parser.add_argument("--k", type=int, default=1, help="gradient accumulation steps")
     parser.add_argument("--rank_dropout", type=float, default=0.3)
     parser.add_argument("--cross_dropout", type=float, default=0.3)
@@ -162,7 +162,7 @@ def arg_parse():
     # -------------------- LOSSES ------------------------------
     parser.add_argument("--rank_w", type=float, default=1.0)
     parser.add_argument("--ties_w", type=float, default=1.0)
-    parser.add_argument("--ranking_margin", type=float, default=0.3)
+    parser.add_argument("--ranking_margin", type=float, default=0.7)
     parser.add_argument("--ranking_margin_ties", type=float, default=None)
     parser.add_argument("--label_smoothing", type=float, default=0)
     parser.add_argument("--attn_w", type=float, default=1.0)
