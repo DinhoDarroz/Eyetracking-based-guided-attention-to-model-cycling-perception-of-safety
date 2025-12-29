@@ -24,6 +24,9 @@ import optuna
 import torch
 import torch.optim as optim
 import wandb
+# AMP (Automatic Mixed Precision) utilities
+from torch.cuda.amp import autocast, GradScaler
+
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint
 from ignite.metrics import Accuracy, RunningAverage
@@ -31,6 +34,8 @@ from ignite.metrics import Accuracy, RunningAverage
 from utils.accuracy import RankAccuracy, RankAccuracy_withMargin
 from utils.losses import compute_loss
 from utils.log import log
+
+from train_utils import print_run_plan  # add near top with other imports
 
 
 class EarlyStopper:
@@ -528,6 +533,7 @@ def _make_train_step(
     grad_clip: float,
     logger,
     trial,
+    scaler: GradScaler,
 ):
     """
     Factory that builds a single training step callable for Ignite.
@@ -581,14 +587,20 @@ def _make_train_step(
             start = timer()
 
         # -----------------------------
-        # Forward pass
+        # Forward pass (AMP-capable)
         # -----------------------------
         inputs, labels = _prepare_batch(data, device)
-        forward_dict = net(*inputs)
-
-        loss = compute_loss(args, forward_dict, labels)
-        raw_loss = loss  # keep unscaled value for logging
-
+        
+        # AMP is controlled by the scaler: if scaler is disabled, autocast does nothing.
+        use_amp = scaler.is_enabled()
+        
+        with autocast(enabled=use_amp):
+            forward_dict = net(*inputs)
+            loss = compute_loss(args, forward_dict, labels)
+        
+        # Keep the *unscaled* loss for logging/metrics.
+        raw_loss = loss
+        
         # -----------------------------
         # NaN guard (debug safety)
         # -----------------------------
@@ -603,27 +615,47 @@ def _make_train_step(
                 f"n_nonties={n_nonties}, n_ties={n_ties}"
             )
             raise ValueError("NaN loss detected; stopping for debugging.")
-
+        
         # -----------------------------
-        # Backward pass (accumulated)
+        # Backward pass (accumulated, AMP-safe)
         # -----------------------------
+        # IMPORTANT: divide by accum_steps BEFORE backward so the accumulated gradient matches
+        # a single batch of size (batch_size * accum_steps).
         loss = loss / accum_steps
-        loss.backward()
-
+        
+        if use_amp:
+            # Scaled backward prevents fp16 gradient underflow
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        
         # -----------------------------
-        # Optimizer / scheduler step
+        # Optimizer / scheduler step (only on accumulation boundary)
         # -----------------------------
         if engine.state.iteration % accum_steps == 0:
+        
+            # If using AMP, unscale gradients before clipping so clipping sees true magnitudes.
+            if use_amp:
+                scaler.unscale_(optimizer)
+        
+            # Optional gradient clipping (global norm)
             if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    net.parameters(), max_norm=grad_clip
-                )
-
-            optimizer.step()
-            optimizer.zero_grad()
-
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+        
+            # Step optimizer (AMP-aware)
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+        
+            # Clear gradients for next accumulation window
+            optimizer.zero_grad(set_to_none=True)
+        
+            # Step per-optimizer-step schedulers (not plateau)
             if scheduler and scheduler_type != "plateau":
                 scheduler.step()
+        
 
         # -----------------------------
         # Logging
@@ -643,12 +675,17 @@ def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
     Used for validation and test engines. No gradients, no optimizer,
     deterministic behavior.
     """
-
     def inference_step(engine, data):
+        # AMP inference is safe and reduces memory; it should match training AMP setting.
+        use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
+    
         with torch.no_grad():
             inputs, labels = _prepare_batch(data, device)
-            forward_dict = net(*inputs)
-            loss = compute_loss(args, forward_dict, labels)
+    
+            with autocast(enabled=use_amp):
+                forward_dict = net(*inputs)
+                loss = compute_loss(args, forward_dict, labels)
+    
             return _build_metrics_output(args, forward_dict, labels, loss)
 
     return inference_step
@@ -835,31 +872,25 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
 # Validation / logging handlers
 # --------------------------------------------------------------------------------------------------------------------
 
-def _attach_epoch_end_step(trainer: Engine, optimizer, accum_steps: int):
+def _attach_epoch_end_step(trainer: Engine, optimizer, accum_steps: int, scaler: GradScaler):
     """
-    Attach a safety hook to ensure the *last* partial gradient-accumulation step
-    in an epoch is not dropped.
+    Flush a partially accumulated gradient at epoch end.
 
-    When this is activated:
-      - The handler is registered immediately when this function is called
-        (during engine/pipeline setup).
-      - The actual optimizer step runs at Events.EPOCH_COMPLETED, i.e., once at the
-        end of every epoch *during trainer.run(...)*.
+    With gradient accumulation, optimizer.step() runs only every accum_steps iterations.
+    If the epoch ends mid-window, we must apply one final step.
 
-    Why it exists:
-      - With gradient accumulation, the training loop typically calls optimizer.step()
-        only every 'accum_steps' iterations.
-      - If the number of iterations in the epoch is not divisible by accum_steps,
-        the last accumulated gradients would never be applied unless explicitly flushed.
+    IMPORTANT: Under AMP, we must use scaler.step(...) (not optimizer.step()).
     """
     @trainer.on(Events.EPOCH_COMPLETED)
     def step_on_epoch_end(engine):
-        # If the epoch ended mid-accumulation (i.e., not on an accumulation boundary),
-        # apply one final optimizer step using the remaining accumulated gradients.
         if engine.state.iteration % accum_steps != 0:
-            optimizer.step()
-            optimizer.zero_grad()
+            if scaler is not None and scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
+            optimizer.zero_grad(set_to_none=True)
 
 def _make_validation_handler(
     args,
@@ -1189,22 +1220,51 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
     # Construct optimizer using the project’s policy (e.g., AdamW, parameter groups, LR scaling).
     optimizer = _build_optimizer(args, net, is_transformer, head_params, backbone_params)
     """
+    # Ensure the model is on the correct device.
     net = net.to(device)
-
-    # If DataParallel, unwrap for configuration/introspection (attributes, parameter names, etc.)
+    
+    # IMPORTANT (DataParallel):
+    # If net is torch.nn.DataParallel, attributes such as `.transformer` live under net.module.
+    # We unwrap ONLY for configuration/optimizer construction.
     net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
     
+    # Transformer-aware configuration: used to apply parameter-group policies (e.g., LR scaling).
     is_transformer = hasattr(net_cfg, "transformer")
     
+    # Split parameters into head vs backbone to enable differential learning rates / weight decay.
     head_params, backbone_params = _split_parameters(net_cfg)
     
+    # Construct optimizer using the project’s policy (e.g., AdamW, parameter groups, LR scaling).
+    # NOTE: we pass net_cfg so the optimizer sees the real module parameters/names.
     optimizer = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
-    # Construct scheduler and tag its type for special handling (e.g., ReduceLROnPlateau).
-    # `accum_steps` and `len(dataloader)` are used to map iteration counts to effective optimizer steps.
+
     scheduler, scheduler_type = _build_scheduler(
         args, optimizer, accum_steps, len(dataloader), args.base_lr
     )
-
+    
+    # ---- RUN PLAN (now you have optimizer + scheduler) ----
+    """
+    print_run_plan(
+        args,
+        train_loader=dataloader,
+        val_loader=val_loader,
+        model=net_cfg,              # unwrap DP for correct inspection
+        optimizer=optimizer,
+        scheduler=scheduler,
+        train_tfms=getattr(dataloader.dataset, "transform", None),
+        eval_tfms=getattr(val_loader.dataset, "transform", None),
+    )
+    """
+    # ------------------------------------------------------------------------------------------------
+    # AMP (Automatic Mixed Precision)
+    # ------------------------------------------------------------------------------------------------
+    # AMP should be explicitly controlled by args.amp (you said you already have it in CLI).
+    # We also require CUDA and an actual CUDA device.
+    use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
+    
+    # GradScaler dynamically scales the loss to prevent fp16 underflow.
+    # If use_amp=False, this becomes a no-op wrapper.
+    scaler = GradScaler(enabled=use_amp)
 
     # ------------------------------------------------------------------------------------------------
     # Ignite engines: training + inference
@@ -1223,6 +1283,7 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
             grad_clip=grad_clip,
             logger=logger,
             trial=trial,
+            scaler=scaler,  # AMP scaler (no-op if disabled)
         )
     )
 
@@ -1237,7 +1298,7 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
     _attach_metrics([trainer, evaluator, evaluator_test], args, device)
 
     # Attach per-epoch hooks that depend on the training engine lifecycle (e.g., accumulation bookkeeping).
-    _attach_epoch_end_step(trainer, optimizer, accum_steps)
+    _attach_epoch_end_step(trainer, optimizer, accum_steps, scaler=scaler)
 
     # ------------------------------------------------------------------------------------------------
     # Epoch-end validation/test evaluation handler
@@ -1272,6 +1333,8 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
     # ------------------------------------------------------------------------------------------------
     # Checkpointing policy
     # ------------------------------------------------------------------------------------------------
+    # Safe W&B run name: avoids AttributeError when wandb is disabled or not initialized
+    run_name = getattr(getattr(wandb, "run", None), "name", "no_wandb")
 
     # Top-k checkpoints scored by validation accuracy.
     # Filename prefix uses model/backbone identifiers to keep runs organized in the same directory.
@@ -1289,7 +1352,7 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
     # Best checkpoint: retains only the single best checkpoint for the current W&B run name.
     handler_best = ModelCheckpoint(
         args.model_dir,
-        "{}".format(wandb.run.name),
+        "{}".format(run_name),
         n_saved=1,
         create_dir=True,
         require_empty=False,
@@ -1301,7 +1364,7 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
     # Last checkpoint: always overwrites to keep the most recent state (useful for resuming/debugging).
     handler_last = ModelCheckpoint(
         args.model_dir,
-        "{}".format(wandb.run.name),
+        "{}".format(run_name),
         n_saved=1,
         create_dir=True,
         require_empty=False,

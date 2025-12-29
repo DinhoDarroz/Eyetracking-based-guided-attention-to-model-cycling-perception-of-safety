@@ -351,17 +351,24 @@ def print_augmentation_plan(args, train_tfms=None, eval_tfms=None):
     """
 
     print("\n================ AUGMENTATION PLAN ================")
+    
+    # ------------------------------------------------------------------
+    # Read augment level (supports new enum + backward compatibility)
+    # ------------------------------------------------------------------
+    augment_level = getattr(args, "augment", "none")
+    if isinstance(augment_level, bool):
+        augment_level = "heavy" if augment_level else "none"
+    augment_level = str(augment_level).lower().strip()
 
     # ------------------------------------------------------------------
-    # Case 1: augmentation flag is OFF
+    # Case 1: augmentation is OFF
     # ------------------------------------------------------------------
-    if not getattr(args, "augment", False):
+    if augment_level == "none":
         print("Data augmentation : OFF")
         print("Train transforms  : deterministic (same as eval preprocessing)")
-        print("  - Resize(short side) → Resize(out_size) → ToTensor → Normalize")
+        print("  - Resize(short side) → CenterCrop(out_size) → ToTensor → Normalize")
         print("==================================================\n")
         return
-
     # ------------------------------------------------------------------
     # Detect PairwiseAugmentationPipeline
     # ------------------------------------------------------------------
@@ -370,7 +377,7 @@ def print_augmentation_plan(args, train_tfms=None, eval_tfms=None):
         and train_tfms.__class__.__name__ == "PairwiseAugmentationPipeline"
     )
 
-    print("Data augmentation : ON")
+    print(f"Data augmentation : ON ({augment_level})")
     print("Augmentation type : Pairwise, label-aware")
 
     if not is_pairwise_pipeline:
@@ -483,9 +490,14 @@ def _summarize_optimizer(optimizer: torch.optim.Optimizer) -> List[str]:
     lines = []
     for i, g in enumerate(optimizer.param_groups):
         lr = g.get("lr")
+        init_lr = g.get("initial_lr", None)
         wd = g.get("weight_decay")
         n = len(g.get("params", []))
-        lines.append(f"  - group {i}: lr={lr}, wd={wd}, tensors={n}")
+
+        if init_lr is not None:
+            lines.append(f"  - group {i}: lr={lr}, init_lr={init_lr}, wd={wd}, tensors={n}")
+        else:
+            lines.append(f"  - group {i}: lr={lr}, wd={wd}, tensors={n}")
     return lines
 
 
@@ -525,8 +537,32 @@ def print_run_plan(
         print(f"  num_ft_blocks: {args.num_ft_blocks}")
 
     # ---------------------------------------------------------------------------------------------
+    # Batching / throughput
+    # ---------------------------------------------------------------------------------------------
+    print("\n[Batching]")
+    bs = getattr(args, "batch_size", None)
+    k = max(1, int(getattr(args, "k", 1)))
+    
+    # Detect DataParallel wrapper
+    num_gpus = 1
+    if model is not None and model.__class__.__name__ == "DataParallel":
+        try:
+            num_gpus = len(getattr(model, "device_ids", []) or []) or 1
+        except Exception:
+            num_gpus = 1
+    
+    print(f"  batch_size   : {bs}")
+    print(f"  grad accum   : k={k}")
+    print(f"  num_gpus     : {num_gpus}")
+    if bs is not None:
+        print(f"  effective_bs : {bs * k * num_gpus}")
+    if train_loader is not None:
+        print(f"  batches/epoch: {len(train_loader)}")
+
+    # ---------------------------------------------------------------------------------------------
     # Data
     # ---------------------------------------------------------------------------------------------
+    """
     print("\n[Data]")
     if train_df is not None:
         print(f"  train rows   : {len(train_df):,}")
@@ -534,7 +570,7 @@ def print_run_plan(
         print(f"  val rows     : {len(val_df):,}")
     if test_df is not None:
         print(f"  test rows    : {len(test_df):,}")
-
+    """
     # ---------------------------------------------------------------------------------------------
     # Transforms
     # ---------------------------------------------------------------------------------------------
@@ -604,7 +640,7 @@ def print_run_plan(
         opt_steps_epoch = math.ceil(batches / k)
         total_steps = opt_steps_epoch * args.max_epochs
 
-        print(f"  grad accum  : k={k}")
+        #print(f"  grad accum  : k={k}")
         print(f"  opt steps  : {opt_steps_epoch}/epoch → {total_steps} total")
 
         if args.scheduler in ("warmup_cosine", "onecycle"):
@@ -643,3 +679,58 @@ def resolve_batch_size(args):
     else:
         return 32
 
+# =============================================================================================== #
+# Augmentation presets
+# =============================================================================================== #
+
+PAIRWISE_AUG_PRESETS = {
+    "light": dict(
+        # Paired invariances
+        hflip_p=0.5,
+        swap_p=0.5,
+
+        # Photometric
+        color_jitter_p=0,
+        jitter_brightness=0.10,
+        jitter_contrast=0.10,
+        jitter_saturation=0.10,
+        jitter_hue=0.03,
+        gray_p=0,
+
+        # Geometry
+        bottom_crop_p=0.0,
+        bottom_keep_h=(0.65, 0.75),
+        bottom_x_jitter_frac=0.04,
+
+        # Tensor
+        erase_p=0.0,
+        erase_scale=(0.05, 0.08),
+        erase_ratio=(0.3, 3.3),
+        erase_value=0.0,
+    ),
+
+    "heavy": dict(
+        # Paired invariances
+        hflip_p=0.35,
+        swap_p=0.50,
+
+        # Photometric
+        color_jitter_p=0.35,
+        jitter_brightness=0.25,
+        jitter_contrast=0.25,
+        jitter_saturation=0.25,
+        jitter_hue=0.08,
+        gray_p=0.10,
+
+        # Geometry
+        bottom_crop_p=0.10,
+        bottom_keep_h=(0.55, 0.75),
+        bottom_x_jitter_frac=0.06,
+
+        # Tensor
+        erase_p=0.10,
+        erase_scale=(0.05, 0.12),
+        erase_ratio=(0.3, 3.3),
+        erase_value=0.0,
+    ),
+}

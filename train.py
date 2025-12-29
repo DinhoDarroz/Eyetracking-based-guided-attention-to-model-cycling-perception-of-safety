@@ -21,7 +21,8 @@ from train_utils import (
     compute_class_weights_from_df,
     print_augmentation_plan,
     print_run_plan,
-    resolve_batch_size
+    resolve_batch_size,
+    PAIRWISE_AUG_PRESETS
 )
 
 import logging
@@ -57,13 +58,19 @@ def arg_parse():
     parser.add_argument("--cuda_id", type=int, default=0)
     parser.add_argument("--multi_gpu", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--gpu_ids", type=str, default="0",help="Comma-separated GPU ids, e.g. '0,1'")
+    parser.add_argument("--amp", nargs="?", const=True, default=False, type=str2bool, help="Enable Automatic Mixed Precision (AMP).")
     parser.add_argument("--resume", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--finetune", "--ft", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--ties", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--log_console", nargs="?", const=True, default=True, type=str2bool)
     parser.add_argument("--log_wandb", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--full_accuracy", nargs="?", const=True, default=False, type=str2bool)
-    parser.add_argument("--augment", nargs="?", const=True, default=False, type=str2bool)
+
+    # -------------------- AUGMENTATION --------------------
+    parser.add_argument(
+        "--augment",type=str,default="none",choices=["none", "light", "heavy"],
+        help="Augmentation level for training: none | light | heavy. (Applied only when gaze alignment is OFF.)",
+    )
     parser.add_argument("--use_class_weights", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool)
 
@@ -491,7 +498,9 @@ def run_training_with_args(args, trial=None):
     # Enable PairwiseAugmentationPipeline only when:
     #   (a) user asked for augmentation, and
     #   (b) gaze-alignment loss is not active (otherwise misalignment risk)
-    enable_pairwise_aug = bool(getattr(args, "augment", False)) and (not use_gaze_alignment)
+    augment_level = getattr(args, "augment", "none")
+    enable_pairwise_aug = (augment_level in ("light", "heavy")) and (not use_gaze_alignment)
+
     
     if enable_pairwise_aug:
         # ------------------------------------------------------------------------------------------- #
@@ -518,44 +527,16 @@ def run_training_with_args(args, trial=None):
             augment=True,
             ties=args.ties,
     
-            # Gaze handling (not used here because enable_pairwise_aug implies gaze alignment is OFF)
             disable_aug_when_gaze=True,
             allow_swap_when_gaze=False,
     
-            # Paired invariances
-            hflip_p=0.25,
-            swap_p=0.50,
-    
-            # Paired photometric
-            color_jitter_p=0.25,
-            jitter_brightness=0.20,
-            jitter_contrast=0.20,
-            jitter_saturation=0.20,
-            jitter_hue=0.05,
-            gray_p=0.05,
-    
-            # Paired geometry (rare)
-            bottom_crop_p=0.05,
-            bottom_keep_h=(0.65, 0.75),
-            bottom_x_jitter_frac=0.04,
-    
-            # Tensor augmentation (rare)
-            erase_p=0.05,
-            erase_scale=(0.05, 0.08),
-            erase_ratio=(0.3, 3.3),
-            erase_value=0.0,
-    
-            # Final geometry / normalization target
             resize_short=256,
             out_size=224,
-        )
     
-    # Optional: print a quick one-line summary for debugging reproducibility
-    #print(
-    #    f"[Transforms] train={'PairwiseAugmentationPipeline' if enable_pairwise_aug else 'eval_tfms'} | "
-    #    f"eval=eval_tfms | augment={bool(getattr(args,'augment',False))} | gaze_alignment={use_gaze_alignment}"
-    #)
-
+            **PAIRWISE_AUG_PRESETS[augment_level],
+        )
+    else:
+        train_tfms = eval_tfms
 
     # =============================================================================================== #
     # 5) DATA LOADERS
