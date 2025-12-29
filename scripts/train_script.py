@@ -1176,7 +1176,7 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
     # ------------------------------------------------------------------------------------------------
     # Model and optimization setup
     # ------------------------------------------------------------------------------------------------
-
+    """
     # Ensure the model is on the correct device.
     net = net.to(device)
 
@@ -1188,12 +1188,23 @@ def train(device, net, dataloader, val_loader, test_loader, args, logger, trial=
 
     # Construct optimizer using the project’s policy (e.g., AdamW, parameter groups, LR scaling).
     optimizer = _build_optimizer(args, net, is_transformer, head_params, backbone_params)
+    """
+    net = net.to(device)
 
+    # If DataParallel, unwrap for configuration/introspection (attributes, parameter names, etc.)
+    net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
+    
+    is_transformer = hasattr(net_cfg, "transformer")
+    
+    head_params, backbone_params = _split_parameters(net_cfg)
+    
+    optimizer = _build_optimizer(args, net_cfg, is_transformer, head_params, backbone_params)
     # Construct scheduler and tag its type for special handling (e.g., ReduceLROnPlateau).
     # `accum_steps` and `len(dataloader)` are used to map iteration counts to effective optimizer steps.
     scheduler, scheduler_type = _build_scheduler(
         args, optimizer, accum_steps, len(dataloader), args.base_lr
     )
+
 
     # ------------------------------------------------------------------------------------------------
     # Ignite engines: training + inference

@@ -35,6 +35,16 @@ warnings.filterwarnings("ignore")
 
 pd.options.mode.chained_assignment = None  # default='warn'
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
+
 
 def arg_parse():
     parser = argparse.ArgumentParser(
@@ -43,16 +53,20 @@ def arg_parse():
     )
 
     # -------------------- BOOLEAN FLAGS --------------------
-    parser.add_argument("--cuda", action="store_true", default=False, help="use CUDA")
-    parser.add_argument("--resume", action="store_true", default=False, help="resume training")
-    parser.add_argument("--finetune", "--ft", action="store_true", default=False)
-    parser.add_argument("--ties", action="store_true", default=False, help="enable ties (3 classes)")
-    parser.add_argument("--log_console", action="store_true", default=True)
-    parser.add_argument("--log_wandb", action="store_true", default=False)
-    parser.add_argument("--full_accuracy", action="store_true", default=False)
-    parser.add_argument("--augment", action="store_true", default=False)
-    parser.add_argument("--use_class_weights", action="store_true", default=False)
-    parser.add_argument("--use_seg", action="store_true", default=False)
+    parser.add_argument("--cuda", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--cuda_id", type=int, default=0)
+    parser.add_argument("--multi_gpu", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--gpu_ids", type=str, default="0",help="Comma-separated GPU ids, e.g. '0,1'")
+    parser.add_argument("--resume", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--finetune", "--ft", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--ties", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--log_console", nargs="?", const=True, default=True, type=str2bool)
+    parser.add_argument("--log_wandb", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--full_accuracy", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--augment", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--use_class_weights", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool)
+
 
     # -------------------- SCHEDULER -------------------------
     parser.add_argument(
@@ -96,8 +110,7 @@ def arg_parse():
     
     # -------------------- EARLY STOPPING -------------------------
     es_group = parser.add_argument_group("Early stopping")
-    es_group.add_argument("--early_stop", action="store_true", default=False,
-                          help="Enable early stopping based on a validation metric.")
+    es_group.add_argument("--early_stop", nargs="?", const=True, default=False, type=str2bool, help="Enable early stopping based on a validation metric.")
     es_group.add_argument("--early_stop_metric", type=str, default="accuracy_validation",
                           help="Metric name to monitor (e.g., accuracy_validation, loss_validation).")
     es_group.add_argument("--early_stop_mode", type=str, default="max", choices=["max", "min"],
@@ -138,12 +151,11 @@ def arg_parse():
     parser.add_argument("--grad_clip", type=float, default=0.0)
 
     # -------------------- PATHS & BASIC PARAMS ---------------
-    parser.add_argument("--cuda_id", type=int, default=0)
     parser.add_argument("--comparisons", type=str, default="comparisons_df.pickle")
     parser.add_argument("--dataset", type=str, default="images/")
     parser.add_argument("--max_epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--resume_checkpoint", type=str)
+    parser.add_argument("--resume_checkpoint", type=str, default=None)
     parser.add_argument("--epoch", type=int, default=0)
     parser.add_argument("--model_dir", type=str, default="models/")
     parser.add_argument("--wandb_project", type=str, default="SubjectiveCyclingSafety")
@@ -434,54 +446,116 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # 4) TRANSFORMS
     # =============================================================================================== #
+    # Policy:
+    #   - eval_tfms: deterministic preprocessing used for validation/test (and also used as fallback for train)
+    #   - train_tfms:
+    #       * if args.augment is ON AND gaze-alignment loss is NOT active -> use pairwise augmentations
+    #       * otherwise -> fall back to eval_tfms for deterministic behavior
+    #
+    # Why disable augmentation when gaze alignment is active?
+    #   - Your gaze alignment loss assumes spatial correspondence between (image ↔ gaze map).
+    #   - Random crops / flips / geometry / color jitter would invalidate this correspondence unless you also
+    #     transform the gaze maps identically.
+    #   - So you currently choose the safe policy: do not augment if gaze alignment is being used.
+    # =============================================================================================== #
     
-    use_gaze_alignment = (args.gaze != "off" and getattr(args, "attn_w", 0.0) > 0.0)
+    # "use_gaze_alignment" means: run has gaze supervision and the loss weight is > 0
+    use_gaze_alignment = (args.gaze != "off" and float(getattr(args, "attn_w", 0.0)) > 0.0)
     
-    eval_tfms = transforms.Compose([CustomTransform(transforms.Resize(256)),
-                                     CustomTransform(transforms.CenterCrop(224)),
-                                     CustomTransform(transforms.ToTensor()),
-                                     CustomTransform(transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                                          std=[0.229, 0.224, 0.225])),
-                                    
-                                     ])
+    # ----------------------------------------------------------------------------------------------- #
+    # 4.1) Deterministic evaluation preprocessing (used for val/test, and as train fallback)
+    # ----------------------------------------------------------------------------------------------- #
+    # Equivalent to: Resize(short side=256) -> CenterCrop(224) -> ToTensor -> Normalize(ImageNet stats)
+    # Note: you wrap each torchvision transform with CustomTransform, presumably because your Dataset
+    # stores images in dicts and CustomTransform applies transforms to the correct dict keys.
+    eval_tfms = transforms.Compose(
+        [
+            CustomTransform(transforms.Resize(256)),
+            CustomTransform(transforms.CenterCrop(224)),
+            CustomTransform(transforms.ToTensor()),
+            CustomTransform(
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                )
+            ),
+        ]
+    )
     
-    if args.augment and (not use_gaze_alignment):
+    # ----------------------------------------------------------------------------------------------- #
+    # 4.2) Training transforms selection logic
+    # ----------------------------------------------------------------------------------------------- #
+    # Default: no augmentation -> match eval preprocessing (deterministic)
+    train_tfms = eval_tfms
+    
+    # Enable PairwiseAugmentationPipeline only when:
+    #   (a) user asked for augmentation, and
+    #   (b) gaze-alignment loss is not active (otherwise misalignment risk)
+    enable_pairwise_aug = bool(getattr(args, "augment", False)) and (not use_gaze_alignment)
+    
+    if enable_pairwise_aug:
+        # ------------------------------------------------------------------------------------------- #
+        # 4.3) Pairwise augmentation config (applies to TRAIN ONLY)
+        # ------------------------------------------------------------------------------------------- #
+        # The pipeline applies *paired* operations to both images of a comparison.
+        # Key invariance operations:
+        #   - Horizontal flip (paired): keeps label same
+        #   - Swap left/right (paired): label is inverted for ranking, remapped for classification
+        #
+        # Mild photometric operations:
+        #   - Color jitter (paired): small changes to brightness/contrast/saturation/hue
+        #   - Grayscale (paired)
+        #
+        # Rare geometry operation:
+        #   - Bottom-band crop (paired): small chance, acts like "sky removal"
+        #
+        # Tensor-level regularization:
+        #   - Random erasing (paired): small chance
+        #
+        # IMPORTANT: You currently disable augmentation whenever gaze alignment is used. Therefore
+        # the gaze-related parameters below are effectively inert in this branch, but kept for clarity.
         train_tfms = PairwiseAugmentationPipeline(
             augment=True,
             ties=args.ties,
     
-            # Gaze handling (won't matter here since gaze is off by condition)
+            # Gaze handling (not used here because enable_pairwise_aug implies gaze alignment is OFF)
             disable_aug_when_gaze=True,
             allow_swap_when_gaze=False,
     
             # Paired invariances
             hflip_p=0.25,
-            swap_p=0.25,
+            swap_p=0.50,
     
             # Paired photometric
-            color_jitter_p=0.05,
-            jitter_brightness=0.30,
-            jitter_contrast=0.30,
-            jitter_saturation=0.30,
+            color_jitter_p=0.25,
+            jitter_brightness=0.20,
+            jitter_contrast=0.20,
+            jitter_saturation=0.20,
             jitter_hue=0.05,
             gray_p=0.05,
     
-            # Paired geometry: bottom-band crop (sky removal)
-            bottom_crop_p=0.25,
+            # Paired geometry (rare)
+            bottom_crop_p=0.05,
             bottom_keep_h=(0.65, 0.75),
             bottom_x_jitter_frac=0.04,
     
-            # Tensor augmentation: random erasing
-            erase_p=0.1,
+            # Tensor augmentation (rare)
+            erase_p=0.05,
             erase_scale=(0.05, 0.08),
             erase_ratio=(0.3, 3.3),
             erase_value=0.0,
     
+            # Final geometry / normalization target
             resize_short=256,
             out_size=224,
         )
-    else:
-        train_tfms = eval_tfms
+    
+    # Optional: print a quick one-line summary for debugging reproducibility
+    #print(
+    #    f"[Transforms] train={'PairwiseAugmentationPipeline' if enable_pairwise_aug else 'eval_tfms'} | "
+    #    f"eval=eval_tfms | augment={bool(getattr(args,'augment',False))} | gaze_alignment={use_gaze_alignment}"
+    #)
+
 
     # =============================================================================================== #
     # 5) DATA LOADERS
@@ -525,11 +599,15 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # Define cpu/gpu device
     if args.cuda:
-        device = torch.device("cuda:{}".format(args.cuda_id) if torch.cuda.is_available() else "cpu")
+        assert torch.cuda.is_available(), "ERROR: --cuda was passed but CUDA is not available."
+        if args.multi_gpu:
+            gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip() != ""]
+            assert len(gpu_ids) >= 2, "--multi_gpu requires at least 2 GPU ids, e.g. --gpu_ids 0,1"
+            device = torch.device(f"cuda:{gpu_ids[0]}")
+        else:
+            device = torch.device(f"cuda:{args.cuda_id}")
     else:
         device = torch.device("cpu")
-    print('Device:', device)
-    print("Parsing model...")
 
     use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
 
@@ -595,12 +673,31 @@ def run_training_with_args(args, trial=None):
 
     net.to(device)
 
+    if args.cuda and args.multi_gpu:
+        net = torch.nn.DataParallel(net, device_ids=gpu_ids)
+        print(f"[DataParallel] Using GPUs: {gpu_ids} (primary cuda:{gpu_ids[0]})")
+
     if args.resume:
         print("\nResuming training.")
         checkpoint_name = os.path.join(args.model_dir, f"{args.resume_checkpoint}")
         print("Loading model:", checkpoint_name)
-        net.load_state_dict(torch.load(checkpoint_name, map_location=device))
+    
+        state = torch.load(checkpoint_name, map_location=device)
+    
+        # If current model is DataParallel, it expects "module." keys.
+        is_dp = isinstance(net, torch.nn.DataParallel)
+    
+        # If checkpoint keys have "module." but model is not DP, strip them.
+        if not is_dp and any(k.startswith("module.") for k in state.keys()):
+            state = {k.replace("module.", "", 1): v for k, v in state.items()}
+    
+        # If model is DP but checkpoint keys do not have "module.", add them.
+        if is_dp and not any(k.startswith("module.") for k in state.keys()):
+            state = {f"module.{k}": v for k, v in state.items()}
+    
+        net.load_state_dict(state, strict=True)
         print()
+
 
     # =============================================================================================== #
     # 7) RUN PLAN (centralized)
