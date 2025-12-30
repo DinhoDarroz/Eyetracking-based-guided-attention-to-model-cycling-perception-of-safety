@@ -156,9 +156,6 @@ class Transformer(nn.Module):
         if use_attn_hook:
             self._register_attn_capture()
 
-        #total, trainable = _count_trainable(self.parameters())
-        #print(f"[Transformer] params total={total:,} trainable={trainable:,}")
-
     # ------------------------------------------------------------------
     # Backbone management
     # ------------------------------------------------------------------
@@ -196,51 +193,9 @@ class Transformer(nn.Module):
     # ------------------------------------------------------------------
     # Attention capture (ViT self-attention → patch-level spatial maps)
     # ------------------------------------------------------------------
-    #
-    # Goal
-    # ----
-    # When gaze supervision is enabled, we need a spatial "attention map" from the
-    # transformer that can be compared to eye-tracker heatmaps (e.g., via KL).
-    #
-    # ViT operates on tokens, not pixels:
-    #   - Token 0 is the CLS token (global summary)
-    #   - Tokens 1..N are patch tokens (spatial grid)
-    #
-    # We capture raw self-attention matrices A ∈ R^{B×H×T×T} from attention layers,
-    # then derive a CLS→patch distribution and finally reshape it into a [B, 14, 14]
-    # map to match the gaze-map resolution used elsewhere in this project.
-    #
-    # What is stored
-    # --------------
-    # self._attn_stack : list (per forward pass) of attention tensors from each block
-    #                   each entry is either:
-    #                       - torch.Tensor [B, H, T, T]  (capture succeeded)
-    #                       - None                       (capture failed; placeholder)
-    # self._last_attn  : attention tensor from the last successfully captured block
-    #
-    # Gradient policy
-    # ---------------
-    # To avoid retaining large graphs unnecessarily:
-    #   - If (self.training and self.attn_grad): store attention WITH gradients
-    #   - Otherwise: store attention detached (no gradients)
-    #
-    # Important note
-    # --------------
-    # Many ViT implementations do not return attention weights. We therefore
-    # re-compute attention from Q and K as:
-    #     attn = softmax( (Q K^T) / sqrt(d_head) )
-    #
-    # This is *observational* instrumentation; the original forward behavior is preserved.
-    #
     def _register_attn_capture(self) -> None:
         """
         Register attention capture hooks on all transformer blocks.
-
-        This monkey-patches each block's attention module `forward` method so that,
-        at runtime, we compute and cache the attention weights.
-
-        Expected backbone structure:
-            backbone.blocks[i].attn.qkv exists and behaves like standard ViT/DeiT.
         """
         vt = self.backbone
         if not hasattr(vt, "blocks") or len(vt.blocks) == 0:
@@ -250,134 +205,82 @@ class Transformer(nn.Module):
             original_forward = attn_module.forward
 
             def forward_with_capture(x, *args, **kwargs):
-                """
-                Wrapped attention forward.
-
-                Args:
-                    x: token embeddings entering attention, shape [B, T, D]
-                       B = batch size
-                       T = number of tokens (1 CLS + N patches)
-                       D = embedding dimension
-
-                Side effects:
-                    - Appends attention tensor [B, H, T, T] to self._attn_stack
-                    - Updates self._last_attn with the most recent captured tensor
-                """
                 try:
                     B, T, D = x.shape
                     H = attn_module.num_heads
                     d_head = D // H
 
-                    # 1) Compute Q, K, V in the same format as ViT internals.
-                    #    qkv: [B, T, 3*D]
+                    # 1) Compute Q, K, V
                     qkv = attn_module.qkv(x)
-
-                    # 2) Reshape and split:
-                    #    -> [B, T, 3, H, d_head] -> [3, B, H, T, d_head]
                     qkv = qkv.reshape(B, T, 3, H, d_head).permute(2, 0, 3, 1, 4)
                     q, k, _v = qkv[0], qkv[1], qkv[2]
 
-                    # 3) Scaled dot-product attention:
-                    #    attn: [B, H, T, T]
+                    # 2) Scaled dot-product attention
                     attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
                     attn = attn.softmax(dim=-1)
 
-                    # 4) Store with or without gradients depending on training mode.
+                    # 3) Store
                     attn_to_store = attn if (self.training and self.attn_grad) else attn.detach()
-
                     self._attn_stack.append(attn_to_store)
-                    self._last_attn = attn_to_store  # convenience: last-block attention
+                    self._last_attn = attn_to_store
 
                 except Exception:
-                    # Defensive behavior:
-                    # If a backbone deviates from expected ViT internals (no qkv, etc.),
-                    # keep alignment by inserting a placeholder.
                     self._attn_stack.append(None)
                     self._last_attn = None
 
-                # Preserve original forward behavior
                 return original_forward(x, *args, **kwargs)
 
-            # Monkey-patch attention forward
             attn_module.forward = forward_with_capture
 
-        # Hook attention modules in all blocks
         for block in vt.blocks:
             attn_module = getattr(block, "attn", None)
             if attn_module is not None:
                 hook_block(attn_module)
 
     def _reset_attention_cache(self) -> None:
-        """
-        Clear attention buffers for a new forward pass.
-
-        Called once per branch forward (left image, right image) so attention
-        maps correspond strictly to the current input.
-        """
         self._attn_stack = []
         self._last_attn = None
+
+    def _get_num_prefix_tokens(self) -> int:
+        """
+        Safely determine the number of prefix tokens (CLS + Registers).
+        DINOv1/DeiT usually have 1 (CLS).
+        DINOv2-reg/DINOv3 usually have 5 (CLS + 4 Registers).
+        """
+        return getattr(self.backbone, "num_prefix_tokens", 1)
 
     def _rollout_attention(self, batch_size: int, device, dtype) -> torch.Tensor:
         """
         Compute attention rollout across all captured blocks.
-
-        Rollout (common in ViT interpretability) approximates token influence by
-        multiplying attention matrices across layers, typically after:
-            - averaging heads
-            - adding identity (residual connection)
-            - row-normalizing
-
-        Output:
-            Tensor [B, 14, 14] representing a probability-like CLS→patch map.
-
-        Fallback:
-            If no attention was captured (or capture failed), return uniform maps.
+        FIXED: Correctly handles register tokens by dynamically detecting prefix length.
         """
         if not self._attn_stack:
             return torch.full((batch_size, 14, 14), 1.0 / (14 * 14), device=device, dtype=dtype)
 
-        # Keep only valid tensors; placeholders (None) are ignored.
         attns: List[torch.Tensor] = [a for a in self._attn_stack if isinstance(a, torch.Tensor)]
         if not attns:
             return torch.full((batch_size, 14, 14), 1.0 / (14 * 14), device=device, dtype=dtype)
 
-        # result starts as identity: [B, T, T]
         T = attns[0].size(-1)
         result = torch.eye(T, device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1, 1)
 
         for attn in attns:
-            # Average over heads: [B, T, T]
             attn_mean = attn.mean(dim=1)
-
-            # Add identity (residual path) and renormalize rows.
             attn_aug = attn_mean + torch.eye(T, device=device, dtype=dtype)
             attn_aug = attn_aug / attn_aug.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-
-            # Compose influence across layers: [B, T, T]
             result = result @ attn_aug
 
-        # Extract CLS→patch tokens:
-        #   CLS token index is 0
-        #   patch tokens start at index 1
-        cls_to_patches = result[:, 0, 1:]  # [B, N_patches]
+        # --- FIX: Dynamically skip prefix tokens ---
+        num_prefix = self._get_num_prefix_tokens()
+        
+        # CLS is at index 0. We want patches, which start after all prefix tokens.
+        cls_to_patches = result[:, 0, num_prefix:] 
 
         return self._tokens_to_map(cls_to_patches, batch_size, device, dtype)
 
     def _tokens_to_map(self, cls_to_patches: torch.Tensor, batch_size: int, device, dtype) -> torch.Tensor:
         """
         Convert a CLS→patch token distribution into a fixed-resolution spatial map.
-
-        Input:
-            cls_to_patches: [B, N] (N = number of patch tokens)
-
-        Steps:
-            1) Infer patch grid size if N is a perfect square (e.g., 14*14, 16*16).
-            2) Reshape into [B, 1, grid, grid] if possible (else keep as [B, 1, 1, N]).
-            3) Upsample/downsample via bilinear interpolation to [B, 1, 14, 14].
-            4) Normalize so sum over spatial positions = 1 per sample.
-
-        Output:
-            attn_map: [B, 14, 14] probability-like map (sums to 1 per sample)
         """
         num_patches = cls_to_patches.size(1)
         grid = int(math.sqrt(num_patches))
@@ -389,10 +292,10 @@ class Transformer(nn.Module):
             # Non-square / unknown token layout; keep a degenerate grid.
             attn_map = cls_to_patches.view(batch_size, 1, 1, num_patches)
 
-        # Resize to the gaze-map resolution expected by your pipeline.
+        # Resize to the gaze-map resolution (14x14)
         attn_map = F.interpolate(attn_map, size=(14, 14), mode="bilinear", align_corners=False)
 
-        # Normalize to sum=1 per sample (probability distribution over 14x14 locations).
+        # Normalize to sum=1 per sample
         flat = attn_map.view(batch_size, -1)
         flat = flat / flat.sum(dim=1, keepdim=True).clamp(min=1e-6)
 
@@ -402,20 +305,7 @@ class Transformer(nn.Module):
     def _cls_attention_map(self, batch_size: int, device, dtype) -> torch.Tensor:
         """
         Build a CLS→patch attention map for the current forward pass.
-
-        Modes:
-            - "rollout": compose attentions across all blocks (see _rollout_attention)
-            - otherwise: use *last captured block* attention
-
-        For last-block mode:
-            1) average attention across heads: [B, H, T, T] -> [B, T, T]
-            2) take CLS row: [B, T]
-            3) drop CLS→CLS entry -> CLS→patches: [B, N_patches]
-            4) optional "topk": keep only the strongest k patch weights
-            5) convert tokens to [B, 14, 14] map via _tokens_to_map
-
-        Fallback:
-            If attention is unavailable, return uniform maps.
+        FIXED: Correctly handles register tokens by dynamically detecting prefix length.
         """
         if self.attention_mode == "rollout":
             return self._rollout_attention(batch_size, device, dtype)
@@ -426,14 +316,16 @@ class Transformer(nn.Module):
         # Average across heads: [B, T, T]
         attn = self._last_attn.mean(dim=1)
 
-        # CLS attends to all tokens: [B, T]
+        # CLS attends to all tokens: [B, T] (CLS is always at index 0)
         cls_to_all = attn[:, 0]
 
-        # Drop CLS→CLS entry, keep CLS→patch distribution: [B, N_patches]
-        cls_to_patches = cls_to_all[:, 1:]
+        # --- FIX: Dynamically skip prefix tokens ---
+        num_prefix = self._get_num_prefix_tokens()
+
+        # Drop CLS+Registers, keep only patch tokens: [B, N_patches]
+        cls_to_patches = cls_to_all[:, num_prefix:]
 
         if self.attention_mode == "topk" and self.topk and self.topk > 0:
-            # Keep only top-k patch tokens per sample, zero out the rest.
             k = min(self.topk, cls_to_patches.size(1))
             values, indices = cls_to_patches.topk(k=k, dim=1)
             mask = torch.zeros_like(cls_to_patches)
@@ -513,10 +405,10 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
-    # Lightweight smoke test (uses timm if available)
     try:
         import timm
 
+        # Test with a standard ViT (1 prefix token)
         backbone = timm.create_model(
             "deit_tiny_patch16_224",
             pretrained=False,

@@ -596,7 +596,8 @@ def _make_train_step(
         
         with autocast(enabled=use_amp):
             forward_dict = net(*inputs)
-            loss = compute_loss(args, forward_dict, labels)
+            
+        loss = compute_loss(args, forward_dict, labels)
         
         # Keep the *unscaled* loss for logging/metrics.
         raw_loss = loss
@@ -684,7 +685,8 @@ def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
     
             with autocast(enabled=use_amp):
                 forward_dict = net(*inputs)
-                loss = compute_loss(args, forward_dict, labels)
+                
+            loss = compute_loss(args, forward_dict, labels)
     
             return _build_metrics_output(args, forward_dict, labels, loss)
 

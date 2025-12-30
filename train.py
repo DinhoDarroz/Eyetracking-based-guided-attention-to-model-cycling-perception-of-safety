@@ -470,15 +470,29 @@ def run_training_with_args(args, trial=None):
     use_gaze_alignment = (args.gaze != "off" and float(getattr(args, "attn_w", 0.0)) > 0.0)
     
     # ----------------------------------------------------------------------------------------------- #
+    # 4.0) Determine resolution based on backbone (Dynamic Resize)
+    # ----------------------------------------------------------------------------------------------- #
+    # DINOv3 (ViT-B) is pre-trained at 256x256. 
+    # Standard models (DeiT, DINOv1/v2, VGG, ResNet) typically use 224x224.
+    if args.backbone == "vit_base_dinov3":
+        target_crop = 256
+        resize_dim = 256  # Resize to 256, then crop 256 (effectively takes the whole center square)
+    else:
+        target_crop = 224
+        resize_dim = 256  # Standard ImageNet practice: resize to 256, then center crop 224
+
+    print(f"Transform config -> Resize: {resize_dim}, Crop: {target_crop} (Backbone: {args.backbone})")
+
+    # ----------------------------------------------------------------------------------------------- #
     # 4.1) Deterministic evaluation preprocessing (used for val/test, and as train fallback)
     # ----------------------------------------------------------------------------------------------- #
-    # Equivalent to: Resize(short side=256) -> CenterCrop(224) -> ToTensor -> Normalize(ImageNet stats)
+    # Equivalent to: Resize(short side) -> CenterCrop(target) -> ToTensor -> Normalize(ImageNet stats)
     # Note: you wrap each torchvision transform with CustomTransform, presumably because your Dataset
     # stores images in dicts and CustomTransform applies transforms to the correct dict keys.
     eval_tfms = transforms.Compose(
         [
-            CustomTransform(transforms.Resize(256)),
-            CustomTransform(transforms.CenterCrop(224)),
+            CustomTransform(transforms.Resize(resize_dim)),
+            CustomTransform(transforms.CenterCrop(target_crop)),
             CustomTransform(transforms.ToTensor()),
             CustomTransform(
                 transforms.Normalize(
@@ -530,14 +544,13 @@ def run_training_with_args(args, trial=None):
             disable_aug_when_gaze=True,
             allow_swap_when_gaze=False,
     
-            resize_short=256,
-            out_size=224,
+            resize_short=resize_dim,
+            out_size=target_crop,
     
             **PAIRWISE_AUG_PRESETS[augment_level],
         )
     else:
         train_tfms = eval_tfms
-
     # =============================================================================================== #
     # 5) DATA LOADERS
     # =============================================================================================== #
