@@ -64,8 +64,8 @@ def _init_wandb_summary_keys() -> None:
         "max_accuracy_validation": float("-inf"),
         "max_accuracy_test": float("-inf"),
         # Optional explicit names (recommended for clarity).
-        "accuracy_train_at_best_val": float("-inf"),
-        "accuracy_test_at_best_val": float("-inf"),
+        #"accuracy_train_at_best_val": float("-inf"),
+        #"accuracy_test_at_best_val": float("-inf"),
         "epoch_best_val": None,
     }
     for k, v in defaults.items():

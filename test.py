@@ -34,7 +34,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import torchvision.models as tv_models
 
-from data import ComparisonsDataset, CustomTransform
+from data import ComparisonsDataset, DictTransform
 from scripts.test_script import test
 from train_utils import build_transformer_backbone
 
@@ -173,11 +173,15 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
 
     p.add_argument("--model", type=str)
     p.add_argument("--backbone", type=str)
-    p.add_argument("--finetune", action="store_true")
+    
+    p.add_argument("--finetune", nargs="?", const=True, type=str2bool)
+    
     p.add_argument("--num_ft_blocks", type=int)
     p.add_argument("--rank_dropout", type=float)
     p.add_argument("--cross_dropout", type=float)
-    p.add_argument("--ties", action="store_true")
+    
+    p.add_argument("--ties", nargs="?", const=True, type=str2bool)
+    
     p.add_argument("--gaze", type=str)
     p.add_argument("--attn_w", type=float)
 
@@ -185,6 +189,11 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
     p.add_argument("--ties_w", type=float)
     p.add_argument("--ranking_margin", type=float)
     p.add_argument("--ranking_margin_ties", type=float)
+    
+    p.add_argument("--pooling", type=str)
+    p.add_argument("--pool_k", type=int)
+    p.add_argument("--use_seg", nargs="?", const=True, type=str2bool)
+    p.add_argument("--full_accuracy", nargs="?", const=True, type=str2bool)
 
     known, _unknown = p.parse_known_args(train_cli_args)
 
@@ -296,7 +305,11 @@ def read_data(args) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 def build_model(args):
     TRANSFORMER_BACKBONES = {
         "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
-        "vit_base_dino", "vit_dinov2_base", "eva02_base", "vit_small", "vit_base_dinov3",
+        "vit_base_dino", "vit_dinov2_base", "eva02_base", "vit_small", 
+        "vit_base_dinov3", "dinov3_vitb16", 
+        "beitv2_base_patch16_224", "deit3_base_patch16_224", 
+        "siglip_base_patch16_224", "vit_base_patch16_clip_224",
+        "dinov2_reg_base", "convnext_base"
     }
     CNN_BACKBONES = {"alex", "vgg", "dense", "resnet"}
 
@@ -309,6 +322,10 @@ def build_model(args):
         net = Net(
             backbone=backbone_model,
             model=args.model,
+            # --- START FIX ---
+            pooling=args.pooling,      # Pass the pooling arg
+            pool_k=args.pool_k,        # Pass the pool_k arg
+            # --- END FIX ---
             num_classes=3 if args.ties else 2,
             finetune=args.finetune,
             num_ft_blocks=args.num_ft_blocks,
@@ -316,6 +333,9 @@ def build_model(args):
             cross_dropout=args.cross_dropout,
             use_attn_hook=(args.gaze != "off"),
             return_attn=use_gaze_loss,
+            # You might also want to pass these if they are in your args:
+            # attention_mode=getattr(args, "attention_mode", "last"), 
+            # attn_topk=getattr(args, "attn_topk", None)
         )
         net.attn_grad = use_gaze_loss
         return net
@@ -364,6 +384,16 @@ def _load_checkpoint(net: torch.nn.Module, ckpt_path: str, device: torch.device)
 
     return report
 
+    
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
 
 # -----------------------------
 # CLI
@@ -371,6 +401,7 @@ def _load_checkpoint(net: torch.nn.Module, ckpt_path: str, device: torch.device)
 def parse_args():
     p = argparse.ArgumentParser(description="Checkpoint evaluation", allow_abbrev=False)
 
+    p.add_argument("--log_console", nargs="?", const=True, default=True, type=str2bool)
     p.add_argument("--comparisons", type=str, required=True, help="Pickle file with comparisons dataframe.")
     p.add_argument("--dataset", type=str, required=True, help="Images root directory (e.g., images/).")
     p.add_argument("--checkpoint", type=str, required=True, help="Checkpoint path or filename under --model_dir.")
@@ -379,25 +410,30 @@ def parse_args():
     p.add_argument("--wandb_run_id", type=str, default=None, help="W&B run id (e.g., bz6cgldz) to auto-load config locally.")
     p.add_argument("--wandb_dir", type=str, default="wandb", help="Local W&B directory (default: wandb/).")
 
-    p.add_argument("--cuda", action="store_true", default=False, help="Enable CUDA if available.")
+    p.add_argument("--cuda", nargs="?", const=True, default=False, type=str2bool, help="Enable CUDA if available.")
     p.add_argument("--cuda_id", type=int, default=0, help="CUDA device id.")
+    
     p.add_argument("--batch_size", type=int, default=128, help="Evaluation batch size.")
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers.")
 
     p.add_argument("--cities", type=str, default="all", help='all or comma-separated dataset values (e.g., "berlin,paris").')
-    p.add_argument("--ties", action="store_true", default=False, help="Enable ties (3-class).")
+    
+    p.add_argument("--ties", nargs="?", const=True, default=False, type=str2bool, help="Enable ties (3-class).")
     p.add_argument("--gaze", choices=["off", "use", "only"], default="use", help="Eyetracking handling.")
     p.add_argument("--gaze_root", type=str, default="Eyetracker_attention_maps", help="Folder for .npy gaze maps.")
-    p.add_argument("--use_seg", action="store_true", default=False, help="Use *_seg.jpg images.")
+    p.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool, help="Use *_seg.jpg images.")
 
     p.add_argument("--model", choices=["rcnn", "sscnn", "rsscnn"], default="rcnn", help="Head type used in training.")
     p.add_argument("--backbone", type=str, default="vit_base_dino", help="Backbone used in training.")
-    p.add_argument("--finetune", action="store_true", default=False, help="If backbone was finetuned.")
+    
+    p.add_argument("--finetune", nargs="?", const=True, default=False, type=str2bool, help="If backbone was finetuned.")
     p.add_argument("--num_ft_blocks", type=int, default=1, help="Transformer blocks unfrozen (if finetune).")
+    
     p.add_argument("--rank_dropout", type=float, default=0.3, help="Ranking head dropout (Transformer).")
     p.add_argument("--cross_dropout", type=float, default=0.3, help="Classification head dropout (Transformer).")
 
-    p.add_argument("--full_accuracy", action="store_true", default=False, help="Use margin-based accuracy for ranking.")
+    p.add_argument("--full_accuracy", nargs="?", const=True, default=False, type=str2bool, help="Use margin-based accuracy for ranking.")
+    
     p.add_argument("--ranking_margin", type=float, default=0.3, help="Margin for non-ties ranking.")
     p.add_argument("--ranking_margin_ties", type=float, default=None, help="Margin for ties loss (if used).")
     p.add_argument("--rank_w", type=float, default=1.0, help="Ranking loss weight.")
@@ -407,6 +443,10 @@ def parse_args():
     p.add_argument("--model_dir", type=str, default="models/", help="Used if --checkpoint is not an absolute path.")
     p.add_argument("--notes", type=str, default="", help="Prefix for outputs/saved/* filename.")
     p.add_argument("--seed", type=int, default=7, help="Random seed.")
+    
+    # --- ADDED Missing Pooling Arguments ---
+    p.add_argument("--pooling", type=str, default="cls", choices=["cls", "mean", "max", "concat", "topk"], help="Feature pooling strategy.")
+    p.add_argument("--pool_k", type=int, default=10, help="Number of patches to keep when using --pooling topk")
 
     return p
 
@@ -585,10 +625,10 @@ def main():
     # (STEP 7) DATASET & DATALOADER CONSTRUCTION
     # =============================================================================================== #
     eval_tfms = transforms.Compose([
-        CustomTransform(transforms.Resize(256)),
-        CustomTransform(transforms.CenterCrop(224)),
-        CustomTransform(transforms.ToTensor()),
-        CustomTransform(
+        DictTransform(transforms.Resize(256)),
+        DictTransform(transforms.CenterCrop(224)),
+        DictTransform(transforms.ToTensor()),
+        DictTransform(
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],

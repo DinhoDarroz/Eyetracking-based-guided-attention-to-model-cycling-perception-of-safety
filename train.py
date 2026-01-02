@@ -12,14 +12,18 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import numpy as np
 import wandb
-from data import ComparisonsDataset, get_model_specs, build_transforms, PairwiseAugmentationPipeline
-from torchvision import transforms
+from data import (
+    ComparisonsDataset,
+    get_model_specs,
+    build_eval_transforms,
+    build_train_transforms,
+    Augmentation,
+)
 
 from train_utils import (
     validate_and_normalize_args,
     build_transformer_backbone,
     compute_class_weights_from_df,
-    print_augmentation_plan,
     print_run_plan,
     )
 
@@ -171,7 +175,7 @@ def arg_parse():
     
     parser.add_argument("--backbone", type=str, default="dinov3_vitb16",
         choices=[
-            # --- The "Power 5" (Strict 224x224 -> 14x14 Output) ---
+            #---(Strict 224x224 -> 14x14 Output) ---
             "dinov3_vitb16",             # 1. DINOv3 (Dense Specialist)
             "beitv2_base_patch16_224",   # 2. BEiT v2 (Masked Modeling / Structure)
             "deit3_base_patch16_224",    # 3. DeiT III (Supervised Benchmark)
@@ -470,62 +474,33 @@ def run_training_with_args(args, trial=None):
     print()
 
     # =============================================================================================== #
-    # 3c) BACKBONE FAMILY
+    # 4) TRANSFORMS & MODEL CONFIG (simplified)
     # =============================================================================================== #
-
-    TRANSFORMER_BACKBONES = [
-        # --- The "Power 5" ---
-        "dinov3_vitb16",
-        "beitv2_base_patch16_224",
-        "deit3_base_patch16_224",
-        "siglip_base_patch16_224",
-        "vit_base_patch16_clip_224",
-
-        # --- Modern Transformers ---
-        "eva02_base",
-        "dinov2_reg_base",
-        
-        # --- Legacy Transformers ---
-        "vit_base_dino", 
-        "vit_small",
-        "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
-        
-        # Note: ConvNeXt is technically a CNN, but if you treat it as 
-        # distinct from standard "resnet" logic, you might keep it separate.
-        # However, purely structurally, it belongs in CNN_BACKBONES 
-        # unless your wrapper handles it specifically.
-        "convnext_base",
-    ]
+    # Evaluation preprocessing is deterministic and always uses the backbone-specific
+    # resolution and normalization parameters.
+    #
+    # Training preprocessing follows a simple policy:
+    #   - if args.augment is "light" or "heavy" -> apply the pairwise Augmentation
+    #   - otherwise -> train preprocessing equals evaluation preprocessing
+    # =============================================================================================== #
     
-    CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
-    # =============================================================================================== #
-    # 4) TRANSFORMS & MODEL CONFIG
-    # =============================================================================================== #
-    # We now offload the complexity of "timm" configs, gaze logic, and augmentations to train_utils.
-    # This ensures train.py remains readable and focused on the training loop.
-    # =============================================================================================== #
-
-    # 4.1) Retrieve Model Specifications
-    # Automatically gets the correct resolution (224/384/448), interpolation (bicubic/bilinear),
-    # and mean/std for your specific backbone (ViT, ResNet, EVA-02, etc.).
     model_specs = get_model_specs(args.backbone)
-
-    # 4.2) Build Transforms
-    # This function internally handles:
-    #   1. Deterministic val/test transforms (Resize -> CenterCrop -> Norm).
-    #   2. Training policy:
-    #      - If Gaze Alignment is ON -> Forces deterministic transforms (safety).
-    #      - If Augment is ON (and Gaze OFF) -> Uses PairwiseAugmentationPipeline.
-    train_tfms, eval_tfms = build_transforms(args, model_specs)
-
-    # 4.3) Logging
-    print(f"\n[Transforms Setup]")
-    print(f"Backbone:      {args.backbone}")
-    print(f"Input Size:    {model_specs['input_size']}")
-    print(f"Crop %:        {model_specs['crop_pct']}")
-    print(f"Interpolation: {model_specs['interpolation']}")
-    print(f"Training Mode: {'Pairwise Augmentation' if getattr(train_tfms, 'augment', False) else 'Deterministic (Standard)'}")
-    print("-" * 60)
+    eval_tfms, eval_meta = build_eval_transforms(model_specs)
+    
+    aug_obj, train_meta = build_train_transforms(args, eval_meta)
+    if aug_obj is None:
+        train_tfms = eval_tfms
+    else:
+        train_tfms = aug_obj
+    
+    args.transforms_meta = {
+        "backbone": args.backbone,
+        "model_specs": dict(model_specs),
+        "eval": dict(eval_meta),
+        "train": dict(train_meta),
+        "train_transform_class": train_tfms.__class__.__name__,
+        "eval_transform_class": eval_tfms.__class__.__name__,
+    }
 
     # =============================================================================================== #
     # 5) DATA LOADERS
@@ -560,7 +535,7 @@ def run_training_with_args(args, trial=None):
         use_seg=args.use_seg,
     )
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=False)
 
@@ -581,6 +556,32 @@ def run_training_with_args(args, trial=None):
     print("Device:", device)
 
     use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and args.attn_w > 0)
+
+    
+    # ------BACKBONE FAMILIES--------
+
+    TRANSFORMER_BACKBONES = [
+        # --- The "Power 5" ---
+        "dinov3_vitb16",
+        "beitv2_base_patch16_224",
+        "deit3_base_patch16_224",
+        "siglip_base_patch16_224",
+        "vit_base_patch16_clip_224",
+
+        # --- Modern Transformers ---
+        "eva02_base",
+        "dinov2_reg_base",
+        
+        # --- Legacy Transformers ---
+        "vit_base_dino", 
+        "vit_small",
+        "deit_base", "deit_small", "deit_tiny", "deit_base_distilled",
+        
+    ]
+    
+    CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
+
+    # --------------------------------------
 
     if args.backbone in TRANSFORMER_BACKBONES:
         print("Using TRANSFORMER model (nets.transformer).")
@@ -678,8 +679,10 @@ def run_training_with_args(args, trial=None):
     run_name = ""
     if args.log_wandb and wandb.run is not None:
         run_name = wandb.run.name
-    print("Training:", run_name)
-
+    print("\n[Wandb]")
+    print(f"  Run Name     : {run_name}")
+    print("=" * 100 + "\n")
+    
     if trial is not None:
         trial.set_user_attr("wandb_run_name", run_name)
 

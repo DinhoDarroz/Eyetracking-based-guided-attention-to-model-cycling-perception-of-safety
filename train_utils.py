@@ -279,9 +279,7 @@ def resolve_preprocess_from_model(backbone_model, *, verbose: bool = False):
 
     return target_crop, resize_dim, mean, std, interpolation, crop_pct
 
-    
-import timm
-import torch
+
 
 def build_transformer_backbone(name: str):
     """
@@ -454,110 +452,142 @@ def compute_class_weights_from_df(
 # PairAugment description helpers
 # =================================================================================================
 
-def print_augmentation_plan(args, train_tfms=None, eval_tfms=None):
+def print_transform_policy(args, train_tfms=None, eval_tfms=None):
     """
-    Print a concise, behavior-accurate summary of the augmentation pipeline.
+    Print a concise, behavior-accurate summary of the transform policy.
+
+    The function reports:
+      - Backbone-specific preprocessing parameters if available (input size, crop pct, interpolation)
+      - Evaluation preprocessing (deterministic)
+      - Training policy:
+          * augmentation disabled -> train == eval
+          * augmentation enabled  -> paired, label-aware augmentation callable
     """
 
-    print("\n================ AUGMENTATION PLAN ================")
-    
     # ------------------------------------------------------------------
-    # Read augment level (supports new enum + backward compatibility)
+    # Backbone specs and resolved eval geometry (preferred source: metadata)
+    # ------------------------------------------------------------------
+    tm = getattr(args, "transforms_meta", None)
+    if isinstance(tm, dict) and isinstance(tm.get("model_specs", None), dict):
+        specs = tm["model_specs"]
+        if "input_size" in specs:
+            print(f"  Input Size:    {specs['input_size']}")
+        if "crop_pct" in specs:
+            print(f"  Crop %:        {specs['crop_pct']}")
+        if "interpolation" in specs:
+            print(f"  Interpolation: {specs['interpolation']}")
+
+        eval_meta = tm.get("eval", {})
+        if isinstance(eval_meta, dict):
+            if "resize_dim" in eval_meta:
+                print(f"  Eval Resize:   {eval_meta['resize_dim']}")
+            if "target_crop" in eval_meta:
+                print(f"  Eval Crop:     {eval_meta['target_crop']}")
+
+    print("\n================ AUGMENTATION PLAN ================")
+
+    # ------------------------------------------------------------------
+    # Read augment level (supports backward compatibility)
     # ------------------------------------------------------------------
     augment_level = getattr(args, "augment", "none")
     if isinstance(augment_level, bool):
         augment_level = "heavy" if augment_level else "none"
     augment_level = str(augment_level).lower().strip()
 
+    if augment_level not in ("none", "light", "heavy"):
+        augment_level = "none"
+
     # ------------------------------------------------------------------
-    # Case 1: augmentation is OFF
+    # Case 1: augmentation OFF
     # ------------------------------------------------------------------
     if augment_level == "none":
         print("Data augmentation : OFF")
         print("Train transforms  : deterministic (same as eval preprocessing)")
+        print("Eval transforms   : deterministic")
         print("  - Resize(short side) → CenterCrop(out_size) → ToTensor → Normalize")
         print("==================================================\n")
         return
+
     # ------------------------------------------------------------------
-    # Detect PairwiseAugmentationPipeline
+    # Detect supported pairwise augmentation callable
     # ------------------------------------------------------------------
-    is_pairwise_pipeline = (
+    is_supported_pairwise = (
         train_tfms is not None
-        and train_tfms.__class__.__name__ == "PairwiseAugmentationPipeline"
+        and train_tfms.__class__.__name__ == "Augmentation"
     )
 
     print(f"Data augmentation : ON ({augment_level})")
     print("Augmentation type : Pairwise, label-aware")
 
-    if not is_pairwise_pipeline:
+    if not is_supported_pairwise:
         print("\n[WARNING]")
-        print("  - Expected PairwiseAugmentationPipeline but found:", type(train_tfms))
+        print("  - Expected Augmentation but found:", type(train_tfms))
         print("==================================================\n")
         return
 
-    pa = train_tfms  # alias for readability
+    pa = train_tfms  # alias
 
     # ------------------------------------------------------------------
-    # Gaze policy (run-level) and transform policy (transform-level)
-    # ------------------------------------------------------------------
-    gaze_enabled = (getattr(args, "gaze", "off") != "off")
-    disable_aug_when_gaze = getattr(pa, "disable_aug_when_gaze", False)
-    allow_swap_when_gaze = getattr(pa, "allow_swap_when_gaze", False)
-
-    if gaze_enabled and disable_aug_when_gaze:
-        print("\n[Gaze supervision policy]")
-        print("  - Gaze data enabled in run")
-        print("  - Augmentations are disabled on samples with eyetracker gaze (policy)")
-
-        print("\n[Pairwise structure on gaze samples]")
-        if allow_swap_when_gaze:
-            print(f"  - Left/right swap        : p={pa.swap_p:g} (allowed on gaze samples)")
-            print("  - Horizontal flip        : OFF on gaze samples")
-        else:
-            print("  - Swap / flip            : OFF on gaze samples (deterministic)")
-
-        print("\n[Effective preprocessing on gaze samples]")
-        print("  - Resize(short side) → Resize(out_size) → ToTensor → Normalize")
-
-        # Note: non-gaze samples may still be augmented; say that explicitly.
-        print("\n[Non-gaze samples]")
-        print("  - Non-gaze samples follow the full augmentation plan below")
-
-    # ------------------------------------------------------------------
-    # Full pairwise augmentation (for samples where augmentation is enabled)
+    # Paired structure and label behavior
     # ------------------------------------------------------------------
     print("\n[Pairwise structure]")
-    print(f"  - Horizontal flip        : p={pa.hflip_p:g}")
-    print(f"  - Left/right swap        : p={pa.swap_p:g}")
-    if args.ties:
+    print(f"  - Horizontal flip        : p={getattr(pa, 'hflip_p', 0.0):g}")
+    print(f"  - Left/right swap        : p={getattr(pa, 'swap_p', 0.0):g}")
+
+    ties_enabled = bool(getattr(args, "ties", True))
+    if ties_enabled:
         print("  - Tie handling           : swap-safe (tie label preserved)")
     else:
         print("  - Binary labels          : label inverted on swap")
 
-    print("\n[Photometric augmentation] (paired)")
-    print(f"  - Color jitter           : p={pa.color_jitter_p:g}")
-    print(f"  - Grayscale              : p={pa.gray_p:g}")
+    # ------------------------------------------------------------------
+    # Geometric augmentation (paired)
+    # ------------------------------------------------------------------
+    crop_p = getattr(pa, "crop_p", 0.0)
+    crop_keep = getattr(pa, "crop_keep_area", None)
+    rotation_p = getattr(pa, "rotation_p", 0.0)
+    max_rot = getattr(pa, "max_rotation_deg", None)
 
     print("\n[Geometric augmentation] (paired)")
-    print(f"  - Bottom-band crop       : p={pa.bottom_crop_p:g}")
-    print(f"    • kept height fraction : {pa.bottom_keep_h[0]:.2f}–{pa.bottom_keep_h[1]:.2f}")
-    print(f"    • x-jitter fraction    : {pa.bottom_x_jitter_frac:.3f}")
+    if crop_keep is not None:
+        print(f"  - Random crop            : p={crop_p:g}, keep_area≈{float(crop_keep):.2f}")
+    else:
+        print(f"  - Random crop            : p={crop_p:g}")
+
+    if rotation_p and rotation_p > 0.0 and max_rot is not None:
+        print(f"  - Small rotation         : p={rotation_p:g}, ±{float(max_rot):g}°")
+    else:
+        print("  - Small rotation         : OFF")
+
+    # ------------------------------------------------------------------
+    # Photometric augmentation (paired)
+    # ------------------------------------------------------------------
+    cj_p = getattr(pa, "color_jitter_p", 0.0)
+    gray_p = getattr(pa, "gray_p", 0.0)
+
+    print("\n[Photometric augmentation] (paired)")
+    print(f"  - Color jitter           : p={cj_p:g}")
+    print(f"  - Grayscale              : p={gray_p:g}")
+
+    # ------------------------------------------------------------------
+    # Tensor augmentation (paired)
+    # ------------------------------------------------------------------
+    erase_p = getattr(pa, "erase_p", 0.0)
+    erase_scale = getattr(pa, "erase_scale", None)
 
     print("\n[Tensor augmentation] (paired)")
-    print(f"  - Random erasing         : p={pa.erase_p:g}")
-    print(f"    • erased area range    : {pa.erase_scale[0]:.2f}–{pa.erase_scale[1]:.2f}")
+    print(f"  - Random erasing         : p={erase_p:g}")
+    if erase_scale is not None:
+        print(f"    • erased area range    : {float(erase_scale[0]):.2f}–{float(erase_scale[1]):.2f}")
 
-    # Optional features: only print if they exist
-    if hasattr(pa, "rotation_p") and getattr(pa, "rotation_p", 0.0) > 0.0:
-        max_rot = getattr(pa, "max_rotation", None)
-        if max_rot is not None:
-            print("\n[Optional]")
-            print(f"  - Small rotation         : p={pa.rotation_p:g}, ±{max_rot:g}°")
-
+    # ------------------------------------------------------------------
+    # Effective preprocessing steps
+    # ------------------------------------------------------------------
     print("\n[Deterministic steps]")
     print("  - Resize(short side) → Crop/Resize(out_size) → ToTensor → Normalize")
 
     print("==================================================\n")
+
 
 
 # =================================================================================================
@@ -697,7 +727,10 @@ def print_run_plan(
     # Transforms
     # ---------------------------------------------------------------------------------------------
     print("\n[Transforms]")
-    print_augmentation_plan(args, train_tfms=train_tfms, eval_tfms=eval_tfms)
+    
+    # All transform details (including backbone specs if available) are printed here.
+    print_transform_policy(args, train_tfms=train_tfms, eval_tfms=eval_tfms)
+
 
     # ---------------------------------------------------------------------------------------------
     # Loss recipe
@@ -769,7 +802,7 @@ def print_run_plan(
             warmup_steps = int(total_steps * args.warmup_frac)
             print(f"  warmup     : {warmup_steps} steps ({args.warmup_frac:g})")
 
-    print("=" * 100 + "\n")
+    #print("=" * 100 + "\n")
 
 def resolve_batch_size(args):
     """
@@ -803,181 +836,6 @@ def resolve_batch_size(args):
 
 
 
-def get_parameter_groups(
-    model: nn.Module,
-    *,
-    base_lr: float,
-    weight_decay: float,
-    layer_decay: float = 0.9,
-    backbone_scale: float = 0.1,
-    partial_max_blocks: int = 4,
-    verbose: bool = True,
-):
-    """
-    Build optimizer parameter groups with an AUTO policy:
 
-    - If only the head trains: head-only groups (no LLRD).
-    - If only a few transformer blocks are unfrozen (<= partial_max_blocks): TWO-TIER LR
-        * head lr = base_lr
-        * backbone lr = base_lr * backbone_scale (uniform across unfrozen blocks)
-    - If many blocks are unfrozen: TRUE LLRD over unfrozen transformer blocks
-        * top unfrozen block gets base_lr * backbone_scale
-        * deeper blocks get geometric decay: lr *= layer_decay^(distance_from_top)
-
-    Notes:
-      - This function ONLY includes parameters with requires_grad=True.
-      - Biases and Norm params get weight_decay=0 (standard practice).
-      - Assumes your wrapper exposes `model.backbone.blocks` for ViT-like models.
-    """
-    if base_lr <= 0:
-        raise ValueError(f"base_lr must be > 0 (got {base_lr})")
-    if backbone_scale <= 0:
-        raise ValueError(f"backbone_scale must be > 0 (got {backbone_scale})")
-    if not (0.0 < layer_decay <= 1.0):
-        raise ValueError(f"layer_decay must be in (0,1] (got {layer_decay})")
-    if partial_max_blocks < 1:
-        raise ValueError(f"partial_max_blocks must be >= 1 (got {partial_max_blocks})")
-
-    # ------------------------------------------------------------------
-    # Identify backbone + blocks (ViT-like)
-    # ------------------------------------------------------------------
-    backbone = getattr(model, "backbone", None)
-    blocks = getattr(backbone, "blocks", None) if backbone is not None else None
-
-    # If we can't identify blocks, fall back to a simple scheme:
-    # head vs rest (if name contains 'backbone'), no LLRD.
-    if blocks is None or not isinstance(blocks, (list, nn.ModuleList)) or len(blocks) == 0:
-        if verbose:
-            print("[Optimizer] get_parameter_groups: backbone blocks not found -> fallback (no LLRD).")
-
-        head_decay, head_no_decay, bb_decay, bb_no_decay = [], [], [], []
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            is_no_decay = ("bias" in name) or ("norm" in name)
-            is_backbone = ("backbone" in name)
-
-            if is_backbone:
-                (bb_no_decay if is_no_decay else bb_decay).append(p)
-            else:
-                (head_no_decay if is_no_decay else head_decay).append(p)
-
-        bb_lr = base_lr * backbone_scale
-
-        groups = []
-        if head_decay:
-            groups.append({"params": head_decay, "lr": base_lr, "weight_decay": weight_decay})
-        if head_no_decay:
-            groups.append({"params": head_no_decay, "lr": base_lr, "weight_decay": 0.0})
-        if bb_decay:
-            groups.append({"params": bb_decay, "lr": bb_lr, "weight_decay": weight_decay})
-        if bb_no_decay:
-            groups.append({"params": bb_no_decay, "lr": bb_lr, "weight_decay": 0.0})
-
-        return groups
-
-    # ------------------------------------------------------------------
-    # Determine which transformer blocks are actually trainable
-    # ------------------------------------------------------------------
-    trainable_block_idxs = []
-    for i, blk in enumerate(blocks):
-        if any(p.requires_grad for p in blk.parameters()):
-            trainable_block_idxs.append(i)
-
-    n_trainable_blocks = len(trainable_block_idxs)
-
-    # Detect head-only training (common when finetune is off or num_ft_blocks=0)
-    if n_trainable_blocks == 0:
-        mode = "head_only"
-    elif n_trainable_blocks <= partial_max_blocks:
-        mode = "partial"
-    else:
-        mode = "full"
-
-    if verbose:
-        print(
-            f"[Optimizer] get_parameter_groups: mode={mode} | "
-            f"trainable_blocks={n_trainable_blocks}/{len(blocks)} | "
-            f"base_lr={base_lr:.2e} | bb_top_lr={base_lr * backbone_scale:.2e} | "
-            f"layer_decay={layer_decay:.2f}"
-        )
-
-    # ------------------------------------------------------------------
-    # Helper: choose weight decay
-    # ------------------------------------------------------------------
-    def _wd_for(name: str) -> float:
-        # No weight decay for biases and norms
-        if ("bias" in name) or ("norm" in name):
-            return 0.0
-        return float(weight_decay)
-
-    # ------------------------------------------------------------------
-    # Build groups
-    # ------------------------------------------------------------------
-    groups_map = {}  # key: (group_name, lr, wd) -> dict
-
-    def _add_param(group_name: str, lr: float, wd: float, p: torch.nn.Parameter):
-        key = (group_name, float(lr), float(wd))
-        if key not in groups_map:
-            groups_map[key] = {"params": [], "lr": float(lr), "weight_decay": float(wd)}
-        groups_map[key]["params"].append(p)
-
-    bb_top_lr = base_lr * backbone_scale
-
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-
-        wd = _wd_for(name)
-
-        # Head params (anything not in backbone namespace)
-        if "backbone" not in name:
-            _add_param("head", base_lr, wd, p)
-            continue
-
-        # Backbone params
-        # - Patch/embed tokens and pos/cls embeddings go to "layer_0" with lowest LR (in full mode)
-        # - Norm typically trains with the top LR (or slightly reduced), but we keep it simple.
-        if mode == "head_only":
-            # If we're here, these backbone params must be trainable (rare), but treat as bb_top_lr
-            _add_param("backbone", bb_top_lr, wd, p)
-            continue
-
-        if mode == "partial":
-            # Uniform backbone LR for stability in partial finetuning.
-            _add_param("backbone", bb_top_lr, wd, p)
-            continue
-
-        # mode == "full": apply LLRD over transformer blocks.
-        # Map each block i -> distance from top trainable block
-        # Topmost block (largest index) should have distance 0.
-        # Only blocks that are trainable matter, but we compute distance based on indices.
-        if "blocks" in name:
-            try:
-                parts = name.split(".")
-                bidx = int(parts[parts.index("blocks") + 1])
-
-                # distance from last block index (top)
-                top_idx = max(trainable_block_idxs) if trainable_block_idxs else (len(blocks) - 1)
-                dist = max(0, top_idx - bidx)
-
-                lr = bb_top_lr * (layer_decay ** dist)
-                _add_param(f"block_{bidx}", lr, wd, p)
-                continue
-            except Exception:
-                # If parsing fails, treat as top backbone params
-                _add_param("backbone_misc", bb_top_lr, wd, p)
-                continue
-
-        # Non-block backbone parameters:
-        # - patch_embed / pos_embed / cls_token usually want a smaller LR in full finetune
-        if any(k in name for k in ("patch_embed", "pos_embed", "cls_token")):
-            lr = bb_top_lr * (layer_decay ** (len(blocks)))  # smallest-ish
-            _add_param("embeddings", lr, wd, p)
-        else:
-            # backbone norm / other: treat as top lr
-            _add_param("backbone_other", bb_top_lr, wd, p)
-
-    return list(groups_map.values())
 
 

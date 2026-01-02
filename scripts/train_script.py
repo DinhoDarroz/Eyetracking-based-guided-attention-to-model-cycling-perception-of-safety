@@ -26,6 +26,7 @@ import torch.optim as optim
 import wandb
 # AMP (Automatic Mixed Precision) utilities
 from torch.cuda.amp import autocast, GradScaler
+from torch import nn
 
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint
@@ -35,7 +36,7 @@ from utils.accuracy import RankAccuracy, RankAccuracy_withMargin
 from utils.losses import compute_loss
 from utils.log import log
 
-from train_utils import print_run_plan, get_parameter_groups
+from train_utils import print_run_plan
 
 class EarlyStopper:
     """Simple epoch-level early stopping helper."""
@@ -234,32 +235,294 @@ def _separate_decay(params):
         else:
             decay.append(param)
     return decay, no_decay
+    
+
+def get_parameter_groups(
+    model: nn.Module,
+    *,
+    base_lr: float,
+    weight_decay: float,
+    layer_decay: float = 0.9,
+    backbone_scale: float = 0.1,
+    partial_max_blocks: int = 4,
+    verbose: bool = True,
+):
+    """
+    Build optimizer parameter groups using an automatic fine-tuning policy for
+    transformer-style backbones.
+
+    Overview
+    --------
+    This utility constructs a list of parameter-group dictionaries compatible with
+    PyTorch optimizers (typically AdamW). Each group contains:
+      - "params": list of parameters
+      - "lr": learning rate assigned to that group
+      - "weight_decay": weight decay assigned to that group
+
+    The function is designed for models that expose a "backbone" attribute and,
+    for ViT-like architectures, a "backbone.blocks" sequence of transformer blocks.
+
+    Policy (AUTO)
+    -------------
+    The policy is selected based on how many transformer blocks are actually trainable
+    (i.e., contain at least one parameter with requires_grad=True):
+
+      1) Head-only training ("head_only"):
+         - No transformer blocks are trainable.
+         - Only parameters outside the "backbone" namespace are grouped at base_lr.
+
+      2) Partial fine-tuning ("partial"):
+         - A small number of blocks are trainable (<= partial_max_blocks).
+         - A two-tier learning rate scheme is used:
+             * head lr     = base_lr
+             * backbone lr = base_lr * backbone_scale (uniform across unfrozen blocks)
+
+      3) Full fine-tuning ("full"):
+         - Many blocks are trainable (> partial_max_blocks).
+         - Layer-wise Learning Rate Decay (LLRD) is applied over the trainable blocks:
+             * topmost trainable block uses lr = base_lr * backbone_scale
+             * deeper blocks decay geometrically: lr *= layer_decay ** dist
+               where dist is the distance from the topmost trainable block.
+
+    Weight decay policy
+    -------------------
+    Standard practice is applied:
+      - Bias parameters and normalization parameters receive weight_decay = 0.0.
+      - All other parameters receive the configured weight_decay.
+
+    Notes
+    -----
+    - Only parameters with requires_grad=True are included.
+    - If transformer blocks cannot be identified, the function falls back to a
+      simple two-tier grouping based on whether parameter names include "backbone".
+    """
+    if base_lr <= 0:
+        raise ValueError(f"base_lr must be > 0 (got {base_lr})")
+    if backbone_scale <= 0:
+        raise ValueError(f"backbone_scale must be > 0 (got {backbone_scale})")
+    if not (0.0 < layer_decay <= 1.0):
+        raise ValueError(f"layer_decay must be in (0,1] (got {layer_decay})")
+    if partial_max_blocks < 1:
+        raise ValueError(f"partial_max_blocks must be >= 1 (got {partial_max_blocks})")
+
+    # ------------------------------------------------------------------
+    # Backbone discovery
+    # ------------------------------------------------------------------
+    # The code path targets ViT-like backbones where transformer blocks are
+    # exposed as `model.backbone.blocks`. If this structure is not available,
+    # a fallback policy is used that does not attempt LLRD.
+    backbone = getattr(model, "backbone", None)
+    blocks = getattr(backbone, "blocks", None) if backbone is not None else None
+
+    # ------------------------------------------------------------------
+    # Fallback: backbone blocks not discoverable
+    # ------------------------------------------------------------------
+    # When the block sequence cannot be found (e.g., CNN backbones, non-timm
+    # structures, or custom wrappers), parameter grouping is performed by
+    # name-based routing:
+    #   - parameters containing "backbone" -> backbone group
+    #   - all others                       -> head group
+    # No LLRD is applied in this fallback mode.
+    if blocks is None or not isinstance(blocks, (list, nn.ModuleList)) or len(blocks) == 0:
+        if verbose:
+            print("[Optimizer] get_parameter_groups: backbone blocks not found -> fallback (no LLRD).")
+
+        head_decay, head_no_decay, bb_decay, bb_no_decay = [], [], [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+
+            is_no_decay = ("bias" in name) or ("norm" in name)
+            is_backbone = ("backbone" in name)
+
+            if is_backbone:
+                (bb_no_decay if is_no_decay else bb_decay).append(p)
+            else:
+                (head_no_decay if is_no_decay else head_decay).append(p)
+
+        bb_lr = base_lr * backbone_scale
+
+        groups = []
+        if head_decay:
+            groups.append({"params": head_decay, "lr": base_lr, "weight_decay": weight_decay})
+        if head_no_decay:
+            groups.append({"params": head_no_decay, "lr": base_lr, "weight_decay": 0.0})
+        if bb_decay:
+            groups.append({"params": bb_decay, "lr": bb_lr, "weight_decay": weight_decay})
+        if bb_no_decay:
+            groups.append({"params": bb_no_decay, "lr": bb_lr, "weight_decay": 0.0})
+
+        return groups
+
+    # ------------------------------------------------------------------
+    # Determine the fine-tuning mode from trainable transformer blocks
+    # ------------------------------------------------------------------
+    # Trainable blocks are those for which at least one parameter has
+    # requires_grad=True. This reflects the actual fine-tuning configuration
+    # independent of CLI flags (e.g., partial unfreeze depth).
+    trainable_block_idxs = []
+    for i, blk in enumerate(blocks):
+        if any(p.requires_grad for p in blk.parameters()):
+            trainable_block_idxs.append(i)
+
+    n_trainable_blocks = len(trainable_block_idxs)
+
+    # Mode selection:
+    #   - head_only: no transformer blocks are trainable
+    #   - partial  : small number of blocks are trainable (stable two-tier LR)
+    #   - full     : many blocks are trainable (apply true LLRD)
+    if n_trainable_blocks == 0:
+        mode = "head_only"
+    elif n_trainable_blocks <= partial_max_blocks:
+        mode = "partial"
+    else:
+        mode = "full"
+
+    if verbose:
+        print(
+            f"  mode={mode} | "
+            f"  base_lr={base_lr:.2e} | bb_top_lr={base_lr * backbone_scale:.2e} | "
+            f"  layer_decay={layer_decay:.2f}"
+        )
+    # ------------------------------------------------------------------
+    # Weight decay helper
+    # ------------------------------------------------------------------
+    # Biases and normalization parameters typically do not benefit from L2
+    # regularization under AdamW; they are routed to weight_decay=0.0.
+    def _wd_for(name: str) -> float:
+        if ("bias" in name) or ("norm" in name):
+            return 0.0
+        return float(weight_decay)
+
+    # ------------------------------------------------------------------
+    # Group assembly helper
+    # ------------------------------------------------------------------
+    # groups_map provides stable grouping by (group_name, lr, wd). This ensures
+    # parameters with the same LR and WD share the same optimizer group, which
+    # keeps the optimizer configuration compact and predictable.
+    groups_map = {}
+
+    def _add_param(group_name: str, lr: float, wd: float, p: torch.nn.Parameter):
+        key = (group_name, float(lr), float(wd))
+        if key not in groups_map:
+            groups_map[key] = {"params": [], "lr": float(lr), "weight_decay": float(wd)}
+        groups_map[key]["params"].append(p)
+
+    bb_top_lr = base_lr * backbone_scale
+
+    # ------------------------------------------------------------------
+    # Parameter routing
+    # ------------------------------------------------------------------
+    # Routing is performed by parameter name:
+    #   - Non-backbone parameters  -> "head" (base_lr)
+    #   - Backbone parameters      -> depends on mode:
+    #       * partial: uniform bb_top_lr
+    #       * full   : block-wise LLRD for "blocks.*" parameters
+    #                 and smaller LR for embeddings (patch/pos/cls)
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+
+        wd = _wd_for(name)
+
+        # Head parameters: anything outside the backbone namespace.
+        if "backbone" not in name:
+            _add_param("head", base_lr, wd, p)
+            continue
+
+        # Backbone parameters.
+        if mode == "head_only":
+            # This branch is rarely used because mode=head_only implies no trainable blocks,
+            # but if some backbone parameter is trainable (e.g., backbone norm), it is
+            # treated conservatively using bb_top_lr.
+            _add_param("backbone", bb_top_lr, wd, p)
+            continue
+
+        if mode == "partial":
+            # Partial fine-tuning uses a uniform LR for all trainable backbone parameters.
+            # This tends to be more stable than LLRD when only a few blocks are unfrozen.
+            _add_param("backbone", bb_top_lr, wd, p)
+            continue
+
+        # mode == "full": apply LLRD over transformer blocks.
+        if "blocks" in name:
+            try:
+                parts = name.split(".")
+                bidx = int(parts[parts.index("blocks") + 1])
+
+                # The topmost trainable block (largest index) gets distance=0.
+                top_idx = max(trainable_block_idxs) if trainable_block_idxs else (len(blocks) - 1)
+                dist = max(0, top_idx - bidx)
+
+                lr = bb_top_lr * (layer_decay ** dist)
+                _add_param(f"block_{bidx}", lr, wd, p)
+                continue
+            except Exception:
+                # When parsing fails, default to a conservative top backbone LR.
+                _add_param("backbone_misc", bb_top_lr, wd, p)
+                continue
+
+        # Non-block backbone parameters:
+        # Embedding-related parameters are often sensitive and benefit from smaller LRs
+        # during full fine-tuning. Other backbone parameters (e.g., final norms) use
+        # the top backbone LR.
+        if any(k in name for k in ("patch_embed", "pos_embed", "cls_token")):
+            lr = bb_top_lr * (layer_decay ** (len(blocks)))
+            _add_param("embeddings", lr, wd, p)
+        else:
+            _add_param("backbone_other", bb_top_lr, wd, p)
+
+    return list(groups_map.values())
 
 
 def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_params: list, backbone_params: list):
     """
-    Constructs the optimizer with the correct training policy (LLRD, Weight Decay, etc.).
+    Construct the optimizer according to the backbone family and fine-tuning policy.
+
+    High-level flow
+    ---------------
+    1) The backbone type selects the optimizer family:
+         - Transformer-style backbones -> AdamW (typical for ViT/DeiT/DINO/EVA/ConvNeXt-style transformers)
+         - CNN-style backbones         -> Adam  (simple, uniform-LR baseline)
+
+    2) The fine-tuning flag (args.finetune) selects the parameter routing policy:
+         - finetune=True  -> optimize head + (some or all) backbone parameters
+         - finetune=False -> optimize head parameters only
+
+    Transformer policy details
+    --------------------------
+    - When finetuning transformers, parameter groups are produced by get_parameter_groups().
+      This implements an automatic choice between:
+         * head-only grouping
+         * two-tier LR for partial unfreezing
+         * true LLRD for deeper unfreezing
+
+    - When transformers are frozen (finetune=False), only head parameters are optimized.
+
+    CNN policy details
+    ------------------
+    - CNNs use a single Adam optimizer configuration with a uniform learning rate.
+    - When finetune=False, only head parameters are optimized.
+    - Weight decay is set to 0.0 for the CNN branch to match a common baseline setup.
     """
     base_lr = args.base_lr
     weight_decay = args.weight_decay
 
     # =========================================================================
-    # POLICY A: TRANSFORMERS (ViT, DINO, DeiT, EVA-02, ConvNeXt-as-ViT)
+    # POLICY A: TRANSFORMERS (AdamW)
     # =========================================================================
     if is_transformer:
-        print(f"[Optimizer] Mode: Transformer (AdamW)")
+        print(f"[Optimizer]")
+        print(f"  Mode: Transformer (AdamW)") 
 
-        # 1. Advanced Finetuning: Layer-wise Learning Rate Decay (LLRD)
-        #    We use this ONLY if finetuning is ON. It preserves the "visual cortex" 
-        #    of the model while adapting the high-level concepts.
+        # ---------------------------------------------------------------------
+        # Fine-tuning enabled: build parameter groups (AUTO policy)
+        # ---------------------------------------------------------------------
         if args.finetune:
-            # AUTO policy:
-            # - head_only / partial finetune => two-tier LR (stable)
-            # - full finetune               => real LLRD
             layer_decay = float(getattr(args, "layer_decay", 0.9))
             backbone_scale = float(getattr(args, "backbone_scale", 0.1))
             partial_max_blocks = int(getattr(args, "partial_max_blocks", 4))
-        
+
             optimizer_params = get_parameter_groups(
                 net,
                 base_lr=base_lr,
@@ -269,20 +532,17 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
                 partial_max_blocks=partial_max_blocks,
                 verbose=True,
             )
-        
+
             return optim.AdamW(
                 optimizer_params,
                 betas=(0.9, 0.999),
                 eps=1e-8,
             )
 
-
-        # 2. Frozen Backbone: Only train the Head
-        #    If finetune is False, the backbone params generally have requires_grad=False.
+        # ---------------------------------------------------------------------
+        # Frozen transformer backbone: optimize head only
+        # ---------------------------------------------------------------------
         else:
-            print(f"[Optimizer] Policy: Frozen Backbone (Head Only) | Base LR: {base_lr:.2e}")
-            
-            # Helper to stop weight decay on Biases and LayerNorms (Standard Practice)
             head_decay, head_no_decay = _separate_decay(head_params)
 
             return optim.AdamW(
@@ -295,20 +555,16 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
             )
 
     # =========================================================================
-    # POLICY B: CNNs (Standard VGG, ResNet, etc.)
+    # POLICY B: CNNs (Adam)
     # =========================================================================
     else:
-        print(f"[Optimizer] Mode: CNN (Adam)")
+        # For CNNs, use a uniform-LR Adam configuration.
 
-        # For CNNs, we historically use standard Adam without complex parameter groups.
-        
         if args.finetune:
-            print(f"[Optimizer] Policy: Full Finetuning (Uniform LR) | Base LR: {base_lr:.2e}")
-            # Train everything (Head + Backbone) at the same LR
+            # Full fine-tuning: head + backbone parameters at the same LR.
             params_to_optimize = [p for p in net.parameters() if p.requires_grad]
         else:
-            print(f"[Optimizer] Policy: Frozen Backbone (Head Only) | Base LR: {base_lr:.2e}")
-            # Train only the head
+            # Head-only training: optimize head parameters only.
             params_to_optimize = [p for (_, p) in head_params if p.requires_grad]
 
         return optim.Adam(
@@ -316,7 +572,7 @@ def _build_optimizer(args, net: torch.nn.Module, is_transformer: bool, head_para
             lr=base_lr,
             betas=(0.9, 0.999),
             eps=1e-8,
-            weight_decay=0.0, # Often 0 for simple CNN finetuning
+            weight_decay=0.0,
         )
 
 
@@ -1006,7 +1262,7 @@ def _make_validation_handler(
             # Explicit names (recommended for thesis clarity).
             #"accuracy_train_at_best_val": training_state["train_acc_at_best_val"],
             #"accuracy_test_at_best_val": training_state["test_acc_at_best_val"],
-            #"epoch_best_val": training_state["epoch_best_val"],
+            "epoch_best_val": training_state["epoch_best_val"],
         }
         # RSSCNN exposes an additional classification metric ("c_acc") alongside ranking accuracy.
         if args.model == "rsscnn":
