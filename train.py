@@ -13,12 +13,10 @@ import numpy as np
 import wandb
 from data import (
     ComparisonsDataset,
-    build_eval_transforms,
-    build_train_transforms,
-    ResizeCenterCropAlignGaze,
-    Augmentation,
     _get_interp_mode,
-
+    build_eval_transforms,
+    AUG_PRESETS,
+    Augmentation,
 )
 
 from train_utils import (
@@ -527,7 +525,7 @@ def run_training_with_args(args, trial=None):
     # =============================================================================================== #
     # 3) TRAIN/VAL/TEST SPLIT
     # =============================================================================================== #
-    """
+  
     # 1. Define the Grouping Variable
     # Ideally 'trial_id' represents a unique user session or trip. 
     # If 'trial_id' is not spatial, use the image filename itself to be 100% strict.
@@ -555,7 +553,7 @@ def run_training_with_args(args, trial=None):
     """
     X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
     X_train, X_val  = train_test_split(X_train       , test_size=0.13, random_state=args.seed)
-    """
+
     splits_dir = "splits"
     os.makedirs(splits_dir, exist_ok=True)
     
@@ -610,17 +608,20 @@ def run_training_with_args(args, trial=None):
     print()
 
     # =============================================================================================== #
-    # 4) TRANSFORMS & MODEL CONFIG (simplified)
+    # 4) TRANSFORMS & MODEL CONFIG 
     # =============================================================================================== #
-    # Evaluation preprocessing is deterministic and always uses the backbone-specific
-    # resolution and normalization parameters.
+    # Evaluation preprocessing is deterministic:
+    #   - backbone-specific resize + center-crop
+    #   - backbone-specific normalization
+    #   - optional gaze alignment (if gaze != "off")
     #
-    # Training preprocessing follows a simple policy:
-    #   - if args.augment is "light" or "heavy" -> apply the pairwise Augmentation
-    #   - otherwise -> train preprocessing equals evaluation preprocessing
+    # Training preprocessing follows a small set of rules:
+    #   - if args.gaze != "off"      -> augmentation is disabled and train == eval
+    #   - if args.gaze == "off" and augment == "none" -> train == eval
+    #   - if args.gaze == "off" and augment in {"light","heavy"} -> use Augmentation
     # =============================================================================================== #
-
-    # Resolve backbone and specs once
+    
+    # Resolve backbone and preprocessing specs once
     backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
     
     # 1) Determine gaze grid size (backbone-specific, e.g., 14x14)
@@ -632,52 +633,81 @@ def run_training_with_args(args, trial=None):
         grid_h, grid_w = forced, forced
     
     args.gaze_grid_size = (int(grid_h), int(grid_w))
-    args.gaze_map_size_int = int(grid_h) 
-
-    # 2) Decide whether gaze supervision loss is used
-    use_gaze_requested = (args.gaze != "off")
-    #use_gaze = (args.gaze != "off")
+    args.gaze_map_size_int = int(grid_h)
+    
+    # 2) Decide whether gaze is enabled for alignment / supervision
+    use_gaze_requested = (str(args.gaze).lower().strip() != "off")
+    
+    # Keep model-specific gaze-loss logic (independent of transform policy)
     use_gaze_loss = (
         args.model == "rsscnn"
         and use_gaze_requested
         and float(args.attn_w) > 0.0
     )
-    use_gaze = use_gaze_loss
     
-    # 3) Build eval transforms (Always deterministic + aligned gaze)
+    # 3) Build eval transforms (always deterministic; optionally align gaze)
     eval_tfms, eval_meta = build_eval_transforms(
         model_specs,
         gaze_grid_size=args.gaze_grid_size,
         enable_gaze=use_gaze_requested,
     )
-
-    # 4) Build training transforms
-    aug_obj, train_meta = build_train_transforms(
-        args, 
-        eval_meta
-    )
     
-    if use_gaze_loss:
+    # 4) Build training transforms 
+    augment_level = str(getattr(args, "augment", "none")).lower().strip()
+    if augment_level not in ("none", "light", "heavy"):
+        augment_level = "none"
+    
+    # Augmentation is not allowed when gaze is enabled
+    if use_gaze_requested:
         train_tfms = eval_tfms
-        train_meta = dict(train_meta)
-        train_meta["forced_deterministic_reason"] = "gaze_supervision_active"
+        train_meta = {
+            "train_policy": "deterministic (same as eval)",
+            "augment": "none",
+            "forced_deterministic_reason": "gaze_enabled",
+        }
     else:
-        if aug_obj is None:
-            # Case B: Augmentation is OFF. Use standard deterministic pipeline.
+        if augment_level == "none":
             train_tfms = eval_tfms
+            train_meta = {
+                "train_policy": "deterministic (same as eval)",
+                "augment": "none",
+            }
         else:
-            train_tfms = aug_obj
+            preset = AUG_PRESETS[augment_level]
+            train_tfms = Augmentation(
+                augment=True,
+                ties=bool(getattr(args, "ties", True)),
+                resize_short=int(eval_meta["resize_dim"]),
+                out_size=int(eval_meta["target_crop"]),
+                interpolation=_get_interp_mode(eval_meta["interpolation"]),
+                mean=tuple(eval_meta["mean"]),
+                std=tuple(eval_meta["std"]),
+                **preset,
+            )
+            train_meta = {
+                "train_policy": f"pairwise augmentation ({augment_level})",
+                "augment": augment_level,
+                "params": dict(preset),
+            }
     
-    args.expected_img_size = int(model_specs["img_size"])
+    # Expected model image size (for logging / checks)
+    args.expected_img_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
     
+    # Record transform configuration for reproducibility
     args.transforms_meta = {
         "backbone": args.backbone,
         "model_specs": dict(model_specs),
+        "gaze": {
+            "requested": bool(use_gaze_requested),
+            "use_gaze_loss": bool(use_gaze_loss),
+            "grid_size": tuple(args.gaze_grid_size),
+        },
         "eval": dict(eval_meta),
         "train": dict(train_meta),
         "train_transform_class": train_tfms.__class__.__name__,
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
+
     # =============================================================================================== #
     # 5) DATA LOADERS
     # =============================================================================================== #

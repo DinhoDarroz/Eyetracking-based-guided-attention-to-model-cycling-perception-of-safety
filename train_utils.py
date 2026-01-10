@@ -428,64 +428,96 @@ def compute_class_weights_from_df(
 
 def print_transform_policy(args, train_tfms=None, eval_tfms=None):
     """
-    Print a concise, behavior-accurate summary of the transform policy.
+    Print a concise, behavior-accurate summary of the current transform policy.
     """
+
+    def _as_str(x):
+        return "ON" if bool(x) else "OFF"
+
+    def _paired_label(flag: bool):
+        return "Paired" if bool(flag) else "Unpaired"
 
     # ------------------------------------------------------------------
     # Backbone specs and resolved eval geometry
     # ------------------------------------------------------------------
     tm = getattr(args, "transforms_meta", None)
-    if isinstance(tm, dict) and isinstance(tm.get("model_specs", None), dict):
-        specs = tm["model_specs"]
-        if "input_size" in specs:
-            print(f"  Input Size:    {specs['input_size']}")
-        if "crop_pct" in specs:
-            print(f"  Crop %:        {specs['crop_pct']}")
-        if "interpolation" in specs:
-            print(f"  Interpolation: {specs['interpolation']}")
+    specs = {}
+    eval_meta = {}
+    train_meta = {}
+    gaze_meta = {}
 
-        eval_meta = tm.get("eval", {})
-        if isinstance(eval_meta, dict):
-            if "resize_dim" in eval_meta:
-                print(f"  Eval Resize:   {eval_meta['resize_dim']}")
-            if "target_crop" in eval_meta:
-                print(f"  Eval Crop:     {eval_meta['target_crop']}")
+    if isinstance(tm, dict):
+        specs = tm.get("model_specs", {}) if isinstance(tm.get("model_specs", None), dict) else {}
+        eval_meta = tm.get("eval", {}) if isinstance(tm.get("eval", None), dict) else {}
+        train_meta = tm.get("train", {}) if isinstance(tm.get("train", None), dict) else {}
+        gaze_meta = tm.get("gaze", {}) if isinstance(tm.get("gaze", None), dict) else {}
+
+    print("\n================ TRANSFORM POLICY ================")
+
+    if specs:
+        if "input_size" in specs:
+            print(f"  Input Size       : {specs['input_size']}")
+        if "crop_pct" in specs:
+            print(f"  Crop %           : {specs['crop_pct']}")
+        if "interpolation" in specs:
+            print(f"  Interpolation    : {specs['interpolation']}")
+
+    if eval_meta:
+        if "resize_dim" in eval_meta:
+            print(f"  Eval Resize      : {eval_meta['resize_dim']}")
+        if "target_crop" in eval_meta:
+            print(f"  Eval Crop        : {eval_meta['target_crop']}")
+
+    # ------------------------------------------------------------------
+    # Gaze policy (gaze disables augmentation)
+    # ------------------------------------------------------------------
+    gaze_requested = gaze_meta.get("requested", str(getattr(args, "gaze", "off")).lower().strip() != "off")
+    gaze_grid = gaze_meta.get("grid_size", getattr(args, "gaze_grid_size", None))
+    if gaze_grid is not None:
+        print(f"  Gaze Enabled     : {_as_str(gaze_requested)} (grid={tuple(gaze_grid)})")
+    else:
+        print(f"  Gaze Enabled     : {_as_str(gaze_requested)}")
 
     print("\n================ AUGMENTATION PLAN ================")
 
-    # ------------------------------------------------------------------
-    # Read augment level
-    # ------------------------------------------------------------------
-    augment_level = getattr(args, "augment", "none")
+    # Prefer recorded meta if available, otherwise fall back to args.augment
+    augment_level = train_meta.get("augment", getattr(args, "augment", "none"))
     if isinstance(augment_level, bool):
         augment_level = "heavy" if augment_level else "none"
     augment_level = str(augment_level).lower().strip()
-
     if augment_level not in ("none", "light", "heavy"):
         augment_level = "none"
 
+    # If gaze is enabled, augmentation is not permitted
+    if gaze_requested:
+        print("Data augmentation  : OFF (gaze enabled)")
+        print("Train transforms   : deterministic (same as eval preprocessing)")
+        print("Eval transforms    : deterministic + gaze alignment")
+        print("  - Resize(short side) → CenterCrop(out_size) → ToTensor → Normalize")
+        print("  - Gaze: resized/cropped to match image geometry, then downsampled to grid")
+        print("==================================================\n")
+        return
+
+    # No augmentation case
     if augment_level == "none":
-        print("Data augmentation : OFF")
-        print("Train transforms  : deterministic (same as eval preprocessing)")
-        print("Eval transforms   : deterministic")
+        print("Data augmentation  : OFF")
+        print("Train transforms   : deterministic (same as eval preprocessing)")
+        print("Eval transforms    : deterministic")
         print("  - Resize(short side) → CenterCrop(out_size) → ToTensor → Normalize")
         print("==================================================\n")
         return
 
     # ------------------------------------------------------------------
-    # Detect supported pairwise augmentation callable
+    # Detect supported augmentation callable
     # ------------------------------------------------------------------
-    is_supported_pairwise = (
-        train_tfms is not None
-        and train_tfms.__class__.__name__ == "Augmentation"
-    )
+    is_aug = (train_tfms is not None and train_tfms.__class__.__name__ == "Augmentation")
 
-    print(f"Data augmentation : ON ({augment_level})")
-    print("Augmentation type : Pairwise, label-aware")
+    print(f"Data augmentation  : ON ({augment_level})")
+    print("Augmentation type  : Pairwise ranking augmentation (L/R views)")
 
-    if not is_supported_pairwise:
+    if not is_aug:
         print("\n[WARNING]")
-        print("  - Expected Augmentation but found:", type(train_tfms))
+        print("  Expected train_tfms to be an Augmentation instance but found:", type(train_tfms))
         print("==================================================\n")
         return
 
@@ -495,8 +527,8 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None):
     # Pairwise structure
     # ------------------------------------------------------------------
     print("\n[Pairwise structure]")
-    print(f"  - Horizontal flip        : p={getattr(pa, 'hflip_p', 0.0):g}")
-    print(f"  - Left/right swap        : p={getattr(pa, 'swap_p', 0.0):g}")
+    print(f"  - Horizontal flip        : p={getattr(pa, 'hflip_p', 0.0):g} ({_paired_label(getattr(pa, 'paired_hflip', True))})")
+    print(f"  - Left/right swap        : p={getattr(pa, 'swap_p', 0.0):g} (Paired)")
 
     ties_enabled = bool(getattr(args, "ties", True))
     if ties_enabled:
@@ -505,66 +537,77 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None):
         print("  - Binary labels          : label inverted on swap")
 
     # ------------------------------------------------------------------
-    # Geometric augmentation (PAIRED)
+    # Geometric augmentation
     # ------------------------------------------------------------------
-    print("\n[Geometric augmentation] (Paired)")
-    
-    # Report Crop Mode details
-    crop_p = getattr(pa, "crop_p", 0.0)
-    crop_mode = getattr(pa, "crop_mode", "fixed")
-    
-    if crop_mode == "fixed":
-        print(f"  - Random crop            : p={crop_p:g} (Mode: FIXED / Translation only)")
-    elif crop_mode == "mild_zoom":
-        min_z = getattr(pa, "min_zoom", 1.0)
-        print(f"  - Random crop            : p={crop_p:g} (Mode: MILD ZOOM, scale {min_z:.2f}-1.0)")
-    else:
-        print(f"  - Random crop            : p={crop_p:g} (Mode: {crop_mode})")
+    print("\n[Geometric augmentation]")
+    print(f"  - Resize(short side)     : {getattr(pa, 'resize_short', 'unknown')} (always)")
 
-    # Rotation
+    scale_p = getattr(pa, "scale_p", 0.0)
+    if scale_p > 0.0:
+        smin = getattr(pa, "scale_min", 1.0)
+        smax = getattr(pa, "scale_max", 1.0)
+        print(f"  - Scale (zoom-in only)   : p={scale_p:g}, range {smin:.2f}–{smax:.2f} ({_paired_label(getattr(pa, 'paired_scale', True))})")
+    else:
+        print("  - Scale (zoom-in only)   : OFF")
+
     rotation_p = getattr(pa, "rotation_p", 0.0)
     max_rot = getattr(pa, "max_rotation_deg", 0.0)
-    if rotation_p > 0.0 and max_rot > 0:
-        print(f"  - Small rotation         : p={rotation_p:g}, ±{max_rot:g}°")
+    if rotation_p > 0.0 and max_rot > 0.0:
+        print(f"  - Rotation               : p={rotation_p:g}, ±{max_rot:g}° ({_paired_label(getattr(pa, 'paired_rotation', True))})")
     else:
-        print("  - Small rotation         : OFF")
+        print("  - Rotation               : OFF")
+
+    crop_p = getattr(pa, "crop_p", 0.0)
+    out_size = getattr(pa, "out_size", "unknown")
+    if crop_p > 0.0:
+        print(f"  - Crop to out_size       : {out_size} (center by default)")
+        print(f"    • random translation   : p={crop_p:g} ({_paired_label(getattr(pa, 'paired_crop', True))})")
+    else:
+        print(f"  - Crop to out_size       : {out_size} (center crop)")
 
     # ------------------------------------------------------------------
-    # Photometric augmentation (MIXED)
+    # Photometric augmentation
     # ------------------------------------------------------------------
     print("\n[Photometric augmentation]")
-    
-    # Color Jitter is now UNPAIRED (Independent)
     cj_p = getattr(pa, "color_jitter_p", 0.0)
-    if cj_p > 0:
-        print(f"  - Color jitter           : p={cj_p:g} (UNPAIRED / Independent)")
+    if cj_p > 0.0:
+        jb = getattr(pa, "jitter_brightness", 0.0)
+        jc = getattr(pa, "jitter_contrast", 0.0)
+        js = getattr(pa, "jitter_saturation", 0.0)
+        jh = getattr(pa, "jitter_hue", 0.0)
+        print(f"  - Color jitter           : p={cj_p:g} ({_paired_label(getattr(pa, 'paired_color_jitter', False))})")
+        print(f"    • brightness/contrast  : {jb:g} / {jc:g}")
+        print(f"    • saturation/hue       : {js:g} / {jh:g}")
     else:
-        print(f"  - Color jitter           : OFF")
+        print("  - Color jitter           : OFF")
 
-    # Grayscale remains PAIRED
     gray_p = getattr(pa, "gray_p", 0.0)
-    if gray_p > 0:
-        print(f"  - Grayscale              : p={gray_p:g} (Paired)")
+    if gray_p > 0.0:
+        print(f"  - Grayscale              : p={gray_p:g} ({_paired_label(getattr(pa, 'paired_gray', False))})")
     else:
-        print(f"  - Grayscale              : OFF")
+        print("  - Grayscale              : OFF")
 
     # ------------------------------------------------------------------
-    # Tensor augmentation (PAIRED)
+    # Tensor augmentation
     # ------------------------------------------------------------------
+    print("\n[Tensor augmentation]")
     erase_p = getattr(pa, "erase_p", 0.0)
-    print("\n[Tensor augmentation] (Paired)")
-    if erase_p > 0:
-        scale = getattr(pa, "erase_scale_min", 0.02), getattr(pa, "erase_scale_max", 0.2)
-        print(f"  - Random erasing         : p={erase_p:g}")
-        print(f"    • erased area range    : {scale[0]:.2f}–{scale[1]:.2f}")
+    if erase_p > 0.0:
+        smin = getattr(pa, "erase_scale_min", 0.02)
+        smax = getattr(pa, "erase_scale_max", 0.20)
+        rmin = getattr(pa, "erase_ratio_min", 0.3)
+        rmax = getattr(pa, "erase_ratio_max", 3.3)
+        print(f"  - Random erasing         : p={erase_p:g} ({_paired_label(getattr(pa, 'paired_erase', True))})")
+        print(f"    • area fraction        : {smin:.2f}–{smax:.2f}")
+        print(f"    • aspect ratio         : {rmin:.2f}–{rmax:.2f}")
     else:
-        print(f"  - Random erasing         : OFF")
+        print("  - Random erasing         : OFF")
 
     # ------------------------------------------------------------------
-    # Effective preprocessing steps
+    # Final deterministic steps
     # ------------------------------------------------------------------
-    print("\n[Deterministic steps]")
-    print("  - Resize(short side) → Crop(out_size) → ToTensor → Normalize")
+    print("\n[Final deterministic steps]")
+    print("  - ToTensor → Normalize (backbone mean/std)")
     print("==================================================\n")
 
 

@@ -690,8 +690,8 @@ def _make_train_step(
                 print("[DEBUG KL-only] KL inactive for this batch -> falling back to total loss backward")
                 loss = loss_total
         else:
-            #loss = loss_total
-            loss = loss_no_kl #-> No backpropagation
+            loss = loss_total
+            #loss = loss_no_kl #-> No backpropagation
         
         # IMPORTANT: divide by accum_steps AFTER choosing which loss you backprop
         loss = loss / accum_steps
@@ -870,43 +870,24 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
             Accuracy(output_transform=lambda x: (x["logits"], x["label"])).attach(engine, "acc")
 
         # ---------------------------------------------------------------------
-        # RSSCNN: ranking + classification (attach both ranking acc and class acc).
+        # RSSCNN: ranking + classification
         # ---------------------------------------------------------------------
         elif args.model == "rsscnn":
+            # 1. Loss (Rolling Average)
             RunningAverage(output_transform=lambda x: x["loss"], device=device).attach(engine, "loss")
             
-            #is_trainer = hasattr(engine.state, "trial")
-            
+            # 2. Gaze Metrics (If enabled)
             if args.gaze != "off":
-                RunningAverage(
-                    output_transform=lambda x: x.get("loss_kl", 0.0),
-                    device=device
-                ).attach(engine, "loss_kl")
-    
-                RunningAverage(
-                    output_transform=lambda x: x.get("loss_kl_weighted", 0.0),
-                    device=device
-                ).attach(engine, "loss_kl_weighted")
-    
-                RunningAverage(
-                    output_transform=lambda x: x.get("w_kl_eff", 0.0),
-                    device=device
-                ).attach(engine, "w_kl_eff")
-    
-                RunningAverage(
-                    output_transform=lambda x: x.get("gaze_count", 0.0),
-                    device=device
-                ).attach(engine, "gaze_count")               
+                RunningAverage(output_transform=lambda x: x.get("loss_kl", 0.0), device=device).attach(engine, "loss_kl")
+                RunningAverage(output_transform=lambda x: x.get("loss_kl_weighted", 0.0), device=device).attach(engine, "loss_kl_weighted")
+                RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
+                RunningAverage(output_transform=lambda x: x.get("gaze_count", 0.0), device=device).attach(engine, "gaze_count")                
         
-            # Ranking metric uses label_r (pairwise ranking label: left/tie/right).
+            # 3. Ranking Accuracy (Cumulative)
+            # (Kept as cumulative because ranking metrics are often noisy per-batch)
             if args.full_accuracy:
                 RankAccuracy_withMargin(
-                    output_transform=lambda x: (
-                        x["rank_left"],
-                        x["rank_right"],
-                        x["label_r"],
-                        args.ranking_margin,
-                    ),
+                    output_transform=lambda x: (x["rank_left"], x["rank_right"], x["label_r"], args.ranking_margin),
                     device=device,
                 ).attach(engine, "acc")
             else:
@@ -915,9 +896,8 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
                     device=device,
                 ).attach(engine, "acc")
 
-            # Classification accuracy attached under a distinct name to avoid collisions.
+            # 4. Classification Accuracy (Rolling Average / Momentum).
             Accuracy(output_transform=lambda x: (x["logits"], x["label_c"])).attach(engine, "c_acc")
-
         # ---------------------------------------------------------------------
         # Defensive programming: reject unknown model identifiers early.
         # ---------------------------------------------------------------------

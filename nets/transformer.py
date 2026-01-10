@@ -77,8 +77,6 @@ class Transformer(nn.Module):
         override for prefix tokens (CLS + registers). Useful for DINOv3/register variants.
     apply_token_norm:
         If True, applies backbone.norm to token tensors before pooling.
-        WARNING: timm ViTs usually apply norm in forward_features already.
-        Default is False to avoid double-normalization.
     """
 
     def __init__(
@@ -110,8 +108,24 @@ class Transformer(nn.Module):
             raise ValueError(f"Unknown model='{model}'. Expected one of: rcnn/sscnn/rsscnn.")
 
         self.pooling = str(pooling).lower().strip()
-        if self.pooling not in ("cls", "mean", "concat", "topk"):
-            raise ValueError(f"Unknown pooling='{pooling}'. Expected one of: cls/mean/concat/topk.")
+        allowed_poolings = {
+            "cls",
+            "mean",
+            "patch_mean",
+            "reg_mean",
+            "prefix_mean",
+            "max",              
+            "cls_max_concat",   
+            "cls_reg_concat",
+            "cls_reg_add",
+            "concat",
+            "topk",
+        }
+        
+        if self.pooling not in allowed_poolings:
+            raise ValueError(
+                f"Unknown pooling='{pooling}'. Expected one of: {sorted(allowed_poolings)}."
+            )
 
         self.pool_k = int(pool_k)
         self.num_classes = int(num_classes)
@@ -143,28 +157,42 @@ class Transformer(nn.Module):
         embed_dim, detected_prefix = self._inspect_backbone_structure()
         self.num_prefix_tokens = int(force_num_prefix_tokens) if force_num_prefix_tokens is not None else int(detected_prefix)
         self.embed_dim = int(embed_dim)
-
-        # Feature dim changes if we concat CLS + Mean
-        self.feat_dim = self.embed_dim * 2 if self.pooling == "concat" else self.embed_dim
-
+        
+        # Feature dim changes for pooling modes that concatenate vectors -> (B, 2D)
+        TWO_D_POOLINGS = {
+            "concat",           # concat(CLS, patch_mean)
+            "cls_reg_concat",   # concat(CLS, mean(registers))
+            "cls_max_concat",   # concat(CLS, patch_max)
+        }
+        
+        self.pooling = str(self.pooling).lower().strip()
+        self.feat_dim = (self.embed_dim * 2) if self.pooling in TWO_D_POOLINGS else self.embed_dim
+        
         # ------------------------------------------------------------------
         # 3) Normalization layers
         # ------------------------------------------------------------------
         self.apply_token_norm = bool(apply_token_norm)
         self.token_norm: Optional[nn.Module] = self.backbone.norm if hasattr(self.backbone, "norm") else None
-
+        
         # Trainable head-side norms (IMPORTANT: these are outside backbone)
-        self.feat_norm = nn.LayerNorm(self.feat_dim) if self.pooling == "concat" else nn.Identity()
+        self.feat_norm = nn.LayerNorm(self.feat_dim) if self.pooling in TWO_D_POOLINGS else nn.Identity()
         self.pair_norm = nn.LayerNorm(self.feat_dim * 2)
 
         # ------------------------------------------------------------------
         # 4) Heads
         # ------------------------------------------------------------------
-        # Ranking head (RCNN)
-        self.rank_fc_1 = nn.Linear(self.feat_dim, 512)
+
+        # Ranking head (RCNN) - 2 hidden layers
+        self.rank_fc_1 = nn.Linear(self.feat_dim, 384)
+        self.rank_fc_2 = nn.Linear(384, 162)         
         self.rank_relu = nn.ReLU()
         self.rank_drop = nn.Dropout(float(rank_dropout))
-        self.rank_fc_out = nn.Linear(512, 1)
+        self.rank_fc_out = nn.Linear(162, 1)
+       
+        """
+        # Ranking head: no hidden layers (direct projection)
+        self.rank_fc_out = nn.Linear(self.feat_dim, 1)
+        """
 
         # Classification / fusion head (SSCNN/RSSCNN)
         self.cross_fc_1 = nn.Linear(self.feat_dim * 2, 512)
@@ -459,9 +487,6 @@ class Transformer(nn.Module):
             pooled = torch.cat([cls, patch_max], dim=-1)  # (B, 2D)
 
         elif self.pooling == "mean":
-            pooled = cls                                     # (B, D), mean over CLS only
-    
-        elif self.pooling == "patch_mean":
             pooled = patch_mean                              # (B, D)
     
         elif self.pooling == "reg_mean":
@@ -504,7 +529,16 @@ class Transformer(nn.Module):
         x = self.rank_fc_1(pooled)
         x = self.rank_relu(x)
         x = self.rank_drop(x)
+    
+        x = self.rank_fc_2(x)                   
+        x = self.rank_relu(x)
+        x = self.rank_drop(x)
+    
         return self.rank_fc_out(x)
+    """
+    def _rank_score(self, pooled: torch.Tensor) -> torch.Tensor:
+        return self.rank_fc_out(pooled)
+    """
 
     def _fusion_logits(self, left_vec: torch.Tensor, right_vec: torch.Tensor) -> torch.Tensor:
         pair = torch.cat([left_vec, right_vec], dim=-1)
