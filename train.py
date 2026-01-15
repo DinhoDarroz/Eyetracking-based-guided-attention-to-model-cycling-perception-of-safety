@@ -35,6 +35,7 @@ import gc
 import timm
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 import os
+from torchvision import models
 
 
 warnings.filterwarnings("ignore")
@@ -273,6 +274,16 @@ def arg_parse():
     # -------------------- MISC -------------------------------
     parser.add_argument("--seed", type=int, default=5)
     parser.add_argument("--num_ft_blocks", type=int, default=1, help="Number of last transformer blocks to unfreeze when --finetune is set.")
+    parser.add_argument(
+        "--cnn_pool",
+        type=str,
+        default="flatten",
+        choices=["gap", "flatten"],
+        help="CNN head input: 'gap' uses global average pooling (small heads); "
+             "'flatten' uses flattened spatial grid (VGG-style, huge heads).",
+    )
+    parser.add_argument("--backbone_freeze_epochs", type=int, default=4, help="Freeze backbone for first N epochs (requires --finetune).")
+    
     return parser
 
 
@@ -565,7 +576,7 @@ def run_training_with_args(args, trial=None):
     """    
     X_train, X_test = train_test_split(comparisons_df, test_size=0.2, random_state=args.seed)
     X_train, X_val  = train_test_split(X_train       , test_size=0.13, random_state=args.seed)
-    """
+    
     splits_dir = "splits"
     os.makedirs(splits_dir, exist_ok=True)
     
@@ -583,7 +594,7 @@ def run_training_with_args(args, trial=None):
     print(" -", train_path)
     print(" -", val_path)
     print(" -", test_path)
-    """
+    
     total = len(comparisons_df)
     print("=== Splits (on the filtered dataset above) ===")
     print(f"- Train: {len(X_train):,}  [{len(X_train)/total:.2%}]")
@@ -620,29 +631,76 @@ def run_training_with_args(args, trial=None):
     print()
 
     # =============================================================================================== #
-    # 4) TRANSFORMS & MODEL CONFIG 
+    # 4) TRANSFORMS & MODEL CONFIG
     # =============================================================================================== #
-    # Evaluation preprocessing is deterministic:
-    #   - backbone-specific resize + center-crop
-    #   - backbone-specific normalization
-    #   - optional gaze alignment (if gaze != "off")
+    # Transformer backbones:
+    #   - resolve backbone + timm preprocessing specs
+    #   - infer ViT token grid size for gaze alignment (or override via --gaze_map_size)
     #
-    # Training preprocessing follows a small set of rules:
-    #   - if args.gaze != "off"      -> augmentation is disabled and train == eval
-    #   - if args.gaze == "off" and augment == "none" -> train == eval
-    #   - if args.gaze == "off" and augment in {"light","heavy"} -> use Augmentation
+    # CNN backbones:
+    #   - use fixed ImageNet-style SPECS (no timm resolve, no grid inference)
     # =============================================================================================== #
     
-    # Resolve backbone and preprocessing specs once
-    backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
+    # ------BACKBONE FAMILIES--------
+    TRANSFORMER_BACKBONES = [
+        "dinov3_vitb16",
+        "beitv2_base_patch16_224",
+        "deit3_base_patch16_224",
+        "siglip_base_patch16_224",
+        "vit_base_patch16_clip_224",
+        "dinov2_base",
+        "dinov2_reg_base",
+        "eva02_base",
+        "vit_base_patch16_224",
+        "vit_base_dino",
+        "vit_small",
+        "deit_base",
+        "deit_small",
+        "deit_tiny",
+        "deit_base_distilled",
+    ]
     
-    # 1) Determine gaze grid size (backbone-specific, e.g., 14x14)
-    grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
+    CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
+    is_cnn_backbone = str(args.backbone).lower().strip() in CNN_BACKBONES
     
-    # Optional override from CLI
-    if str(args.gaze_map_size).lower() != "auto":
-        forced = int(args.gaze_map_size)
-        grid_h, grid_w = forced, forced
+    # Fixed preprocessing for CNNs (exactly as requested)
+    SPECS = {
+        "input_size": (3, 224, 224),
+        "crop_pct": 0.875,
+        "mean": (0.485, 0.456, 0.406),
+        "std": (0.229, 0.224, 0.225),
+        "interpolation": "bilinear",
+    }
+    
+    # 1) Resolve specs + (optionally) build transformer backbone for grid inference
+    if is_cnn_backbone:
+        backbone_model = None  # CNN path later uses torchvision models; no ViT grid exists here
+        model_specs = {
+            "alias": args.backbone,
+            "timm_id": None,
+            **SPECS,
+            "img_size": int(SPECS["input_size"][-1]),
+        }
+    
+        # For CNNs we cannot infer a token grid; use CLI override if provided,
+        # otherwise default to 14 (works with your gaze folders like 14x14 by default).
+        if str(args.gaze_map_size).lower() != "auto":
+            forced = int(args.gaze_map_size)
+            grid_h, grid_w = forced, forced
+        else:
+            grid_h, grid_w = 14, 14
+    
+    else:
+        # Transformer path: resolve backbone + preprocessing specs once
+        backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
+    
+        # Determine gaze grid size from patch embedding
+        grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
+    
+        # Optional override from CLI
+        if str(args.gaze_map_size).lower() != "auto":
+            forced = int(args.gaze_map_size)
+            grid_h, grid_w = forced, forced
     
     args.gaze_grid_size = (int(grid_h), int(grid_w))
     args.gaze_map_size_int = int(grid_h)
@@ -664,7 +722,7 @@ def run_training_with_args(args, trial=None):
         enable_gaze=use_gaze_requested,
     )
     
-    # 4) Build training transforms 
+    # 4) Build training transforms
     augment_level = str(getattr(args, "augment", "none")).lower().strip()
     if augment_level not in ("none", "light", "heavy"):
         augment_level = "none"
@@ -708,6 +766,7 @@ def run_training_with_args(args, trial=None):
     # Record transform configuration for reproducibility
     args.transforms_meta = {
         "backbone": args.backbone,
+        "backbone_family": "cnn" if is_cnn_backbone else "transformer",
         "model_specs": dict(model_specs),
         "gaze": {
             "requested": bool(use_gaze_requested),
@@ -719,6 +778,7 @@ def run_training_with_args(args, trial=None):
         "train_transform_class": train_tfms.__class__.__name__,
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
+
 
     # =============================================================================================== #
     # 5) DATA LOADERS
@@ -787,27 +847,6 @@ def run_training_with_args(args, trial=None):
     # ---------------------------------------------------------------------------
     use_gaze_loss = (args.model == "rsscnn" and args.gaze != "off" and float(getattr(args, "attn_w", 0.0) or 0.0) > 0.0)
     
-    # ------BACKBONE FAMILIES--------
-    TRANSFORMER_BACKBONES = [
-        "dinov3_vitb16",
-        "beitv2_base_patch16_224",
-        "deit3_base_patch16_224",
-        "siglip_base_patch16_224",
-        "vit_base_patch16_clip_224",
-        "dinov2_base",
-        "dinov2_reg_base",
-        "eva02_base",
-        "vit_base_patch16_224",
-        "vit_base_dino",
-        "vit_small",
-        "deit_base",
-        "deit_small",
-        "deit_tiny",
-        "deit_base_distilled",
-    ]
-    
-    CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
-    
     # TRANSFORMER PATH
     if args.backbone in TRANSFORMER_BACKBONES:
         print(f"Using TRANSFORMER architecture: {args.backbone}")
@@ -855,7 +894,6 @@ def run_training_with_args(args, trial=None):
             except Exception as e:
                 raise RuntimeError(f"Failed to set net.attn_cfg.out_hw to gaze_grid_size={args.gaze_grid_size}: {e}")
     
-    # CNN PATH
     elif args.backbone in CNN_BACKBONES:
         print(f"Using CNN architecture: {args.backbone}")
         from nets.cnn import CNN as Net
@@ -868,12 +906,20 @@ def run_training_with_args(args, trial=None):
             "resnet": models.resnet50,
         }
     
+        flatten_spatial = (getattr(args, "cnn_pool", "gap") == "flatten")
+    
         net = Net(
             backbone=cnn_factory[args.backbone],
             model=args.model,
             finetune=args.finetune,
             num_classes=3 if args.ties else 2,
+            flatten_spatial=flatten_spatial,
+            flat_dim_override=None,  # scratch training: no ckpt inference
+            gaze_grid_size=getattr(args, "gaze_grid_size", (14, 14))[0] if hasattr(args, "gaze_grid_size") else 14,
         )
+    
+        #print(f"[CNN] cnn_pool={args.cnn_pool} -> flatten_spatial={flatten_spatial}, flat_dim={net.flat_dim}")
+
     
     else:
         known_models = TRANSFORMER_BACKBONES + CNN_BACKBONES

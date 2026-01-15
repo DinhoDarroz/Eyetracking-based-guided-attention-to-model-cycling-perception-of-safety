@@ -1018,7 +1018,7 @@ def _make_validation_handler(
         # ---------------------------------------------------------------------
         training_state["val_acc_history"].append(current_val_acc)
         
-        if current_val_acc > float(training_state["best_val_acc"]):
+        if training_state.get("best_state_dict") is None or current_val_acc > float(training_state["best_val_acc"]):
             training_state["best_val_acc"] = float(current_val_acc)
             training_state["epoch_best_val"] = int(trainer.state.epoch)
         
@@ -1028,10 +1028,11 @@ def _make_validation_handler(
                 training_state["test_acc_at_best_val"] = float(current_test_acc)
         
             # Snapshot best weights for final evaluation (best epoch, not last epoch)
-            model_to_save = net.module if hasattr(net, "module") else net
-            training_state["best_state_dict"] = {
-                k: v.detach().cpu().clone() for k, v in model_to_save.state_dict().items()
-            }
+            #model_to_save = net.module if hasattr(net, "module") else net
+            #training_state["best_state_dict"] = {
+            #    k: v.detach().cpu().clone() for k, v in model_to_save.state_dict().items()
+            #}
+            training_state["best_state_dict"] = None
 
         # ---------------------------------------------------------------------
         # 4) Optuna integration (report + pruning)
@@ -1334,7 +1335,7 @@ def train(
     # Checkpointing
     # -----------------------------
     run_name = getattr(getattr(wandb, "run", None), "name", "no_wandb")
-
+    """
     trainer.add_event_handler(
         Events.EPOCH_COMPLETED,
         ModelCheckpoint(
@@ -1348,12 +1349,12 @@ def train(
         ),
         {"model": net},
     )
-
+    """
     trainer.add_event_handler(
         Events.EPOCH_COMPLETED,
         ModelCheckpoint(
             args.model_dir,
-            f"{run_name}",
+            f"{run_name}_best",
             n_saved=1,
             create_dir=True,
             require_empty=False,
@@ -1367,7 +1368,7 @@ def train(
         Events.EPOCH_COMPLETED,
         ModelCheckpoint(
             args.model_dir,
-            f"{run_name}",
+            f"{run_name}_last",
             n_saved=1,
             create_dir=True,
             require_empty=False,
@@ -1408,6 +1409,7 @@ def train(
     # ------------------------------------------------------------------------------------------------
     trainer.run(train_loader, max_epochs=args.max_epochs)
     
+    """
     # ------------------------------------------------------------------------------------------------
     # Final evaluation using best-validation weights (not last epoch)
     # ------------------------------------------------------------------------------------------------
@@ -1429,11 +1431,37 @@ def train(
         training_state["final_best_test_acc"] = float(training_state.get("test_acc_at_best_val", 0.0))
     
     # ------------------------------------------------------------------------------------------------
+    # LOG final evaluation using BEST validation weights (so console/W&B end on epoch_best_val weights)
+    # ------------------------------------------------------------------------------------------------
+
+    final_best_metrics = {
+        # Make it visually “after last epoch” in plots
+        "epoch": int(trainer.state.epoch) + 1,
+        "iteration": int(trainer.state.iteration) + 1,
+        "time": f"{timer() - start_training:.3f}",
+
+        # Report BEST-weights results as the final point
+        "accuracy_train": float(training_state.get("train_acc_at_best_val", 0.0)),
+        "accuracy_validation": float(training_state.get("final_best_val_acc", 0.0)),
+        "accuracy_test": float(training_state.get("final_best_test_acc", 0.0)),
+
+        # Keep the “best tracking” keys consistent
+        "max_accuracy_validation": float(training_state.get("best_val_acc", 0.0)),
+        "max_accuracy_train": float(training_state.get("train_acc_at_best_val", 0.0)),
+        "max_accuracy_test": float(training_state.get("test_acc_at_best_val", 0.0)),
+        "epoch_best_val": int(training_state.get("epoch_best_val") or -1),
+
+        # Optional flag to disambiguate in W&B
+        "final_best_eval": 1,
+    }
+    log(args, final_best_metrics)
+    """
+    # ------------------------------------------------------------------------------------------------
     # W&B finalization (after final eval so final metrics can be logged)
     # ------------------------------------------------------------------------------------------------
     if getattr(args, "log_wandb", False) and wandb.run is not None:
         wandb.finish()
-    
+
     # ------------------------------------------------------------------------------------------------
     # Objective computation
     # ------------------------------------------------------------------------------------------------
