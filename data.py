@@ -485,7 +485,7 @@ AUG_PRESETS = {
 
         "color_jitter": (0.20, 0.20, 0.20, 0.03),
         "gray_p": 0.01,
-        "blur_p": 0.2,
+        "blur_p": 0.3,
         "blur_kernel": 23,
         "blur_sigma": (0.75, 2.0),
 

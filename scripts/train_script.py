@@ -118,52 +118,91 @@ class BackboneFreezeController:
 # Data preparation helpers
 # --------------------------------------------------------------------------------------------------------------------
 
-def _prepare_batch(data: Dict[str, torch.Tensor], device: torch.device) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
+def _set_gaze_bp(model: torch.nn.Module, enabled: bool) -> None:
+    """
+    Enables/disables gradient retention for attention maps inside the transformer,
+    supporting both plain modules and wrapper modules (DataParallel/DDP-like).
+    """
+    if hasattr(model, "set_gaze_backprop"):
+        model.set_gaze_backprop(bool(enabled))
+        return
+
+    if hasattr(model, "module") and hasattr(model.module, "set_gaze_backprop"):
+        model.module.set_gaze_backprop(bool(enabled))
+        return
+
+def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool]:
+    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+    if gaze_mode not in ("off", "align", "guide", "align+guide"):
+        gaze_mode = "off"
+
+    w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
+
+    use_gaze_any = (gaze_mode != "off")
+    use_gaze_kl = (gaze_mode in ("align", "align+guide")) and (w_kl > 0.0)
+    use_gaze_inj = (gaze_mode in ("guide", "align+guide"))
+
+    return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
+
+def _prepare_batch(
+    data: Dict[str, torch.Tensor],
+    device: torch.device,
+    args,
+) -> Tuple[Tuple[torch.Tensor, ...], Dict[str, torch.Tensor]]:
     """
     Prepare a single mini-batch produced by the DataLoader.
 
-    The DataLoader yields a *dict-like* batch containing (at minimum):
-        - "image_l": Tensor [B, 3, H, W]   (left image)
-        - "image_r": Tensor [B, 3, H, W]   (right image)
-
-        - "score_r": Tensor [B] or [B,1]   (ranking label: -1/0/+1)
-        - "score_c": Tensor [B]           (classification label: 0..C-1)
-
-        - "gaze_l":  Tensor [B, 14, 14]   (optional gaze map, if gaze enabled)
-        - "gaze_r":  Tensor [B, 14, 14]
-
-        - "has_eyetracker": Tensor [B] bool (mask: True if gaze valid for BOTH images)
-
-    Returns:
-        inputs:
-            (input_left, input_right)
-            where each is on `device` and has shape [B, 3, H, W]
-
-        labels:
-            dictionary containing all targets and optional supervision signals
-            needed by loss computation and/or metrics.
+    Behavior:
+      - Always returns image tensors as model inputs.
+      - For gaze injection modes ("guide", "align+guide"), model inputs additionally include gaze tensors
+        and has-eye mask so the network can ignore invalid gaze samples.
+      - For alignment modes ("align", "align+guide"), labels include gaze tensors and mask so KL can be computed.
+      - For "off", gaze keys are not required and are not accessed.
     """
-    input_left, input_right = data["image_l"].to(device), data["image_r"].to(device)
+    input_left = data["image_l"].to(device)
+    input_right = data["image_r"].to(device)
 
     label_r = data["score_r"].to(device).float()
     label_c = data["score_c"].to(device).long()
 
-    gaze_l, gaze_r = data["gaze_l"].to(device), data["gaze_r"].to(device)
-    has_eye_mask = data["has_eyetracker"].to(device)
+    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
 
-    # IMPORTANT: these keys match what utils.losses.compute_loss() expects:
-    #   - label_r / label_c
-    #   - gaze_l / gaze_r
-    #   - has_eye_mask (optional)
-    labels = {
+    labels: Dict[str, torch.Tensor] = {
         "label_r": label_r,
         "label_c": label_c,
-        "gaze_l": gaze_l,
-        "gaze_r": gaze_r,
-        "has_eye_mask": has_eye_mask,
     }
 
-    return (input_left, input_right), labels
+    gaze_l = None
+    gaze_r = None
+    has_eye_mask = None
+
+    if use_gaze_any:
+        if "gaze_l" not in data or "gaze_r" not in data:
+            raise KeyError("Batch missing gaze tensors while gaze_mode is not 'off'.")
+
+        gaze_l = data["gaze_l"].to(device)
+        gaze_r = data["gaze_r"].to(device)
+
+        if "has_eyetracker" not in data:
+            raise KeyError("Batch missing 'has_eyetracker' while gaze_mode is not 'off'.")
+
+        has_eye_mask = data["has_eyetracker"].to(device)
+
+        # Labels include gaze whenever gaze is present; KL uses these only when enabled in losses.py
+        labels["gaze_l"] = gaze_l
+        labels["gaze_r"] = gaze_r
+        labels["has_eye_mask"] = has_eye_mask
+
+    # Model input packing:
+    # - off / align: image-only model execution
+    # - guide / align+guide: pass gaze and mask for injection
+    if use_gaze_inj:
+        inputs: Tuple[torch.Tensor, ...] = (input_left, input_right, gaze_l, gaze_r, has_eye_mask)
+    else:
+        inputs = (input_left, input_right)
+
+    return inputs, labels
+
 
 
 def _build_metrics_output(
@@ -223,14 +262,18 @@ def _build_metrics_output(
 
         # When gaze supervision is disabled, metrics are forced to zero
         # to prevent stale logging from previous runs or partially-populated parts.
-        if gaze_mode == "off":
+        gaze_mode, _use_gaze_any, use_gaze_kl, _use_gaze_inj = _resolve_gaze_flags(args)
+
+        # When KL is disabled, force gaze-related metrics to 0.0 to keep logs consistent.
+        if not use_gaze_kl:
             out["loss_kl"] = 0.0
             out["loss_kl_weighted"] = 0.0
             out["w_kl_eff"] = 0.0
             out["gaze_count"] = 0
+            out["gaze_mode"] = str(gaze_mode)
+            out["use_gaze_kl"] = float(use_gaze_kl)
             return out
 
-        # Gaze modes that compute KL for logging (use / use_nobp / only)
         if parts is not None:
             loss_kl = parts.get("loss_kl", 0.0)
             loss_kl_weighted = parts.get("loss_kl_weighted", 0.0)
@@ -241,13 +284,18 @@ def _build_metrics_output(
             )
             out["w_kl_eff"] = float(parts.get("w_kl_eff", 0.0))
             out["gaze_count"] = int(parts.get("gaze_count", 0))
+            out["gaze_mode"] = str(parts.get("gaze_mode", gaze_mode))
+            out["use_gaze_kl"] = float(parts.get("use_gaze_kl", float(use_gaze_kl)))
         else:
             out["loss_kl"] = 0.0
             out["loss_kl_weighted"] = 0.0
             out["w_kl_eff"] = 0.0
             out["gaze_count"] = 0
+            out["gaze_mode"] = str(gaze_mode)
+            out["use_gaze_kl"] = float(use_gaze_kl)
 
         return out
+
 
     raise ValueError(f"Unsupported model type: {args.model}")
 
@@ -541,6 +589,10 @@ def _build_scheduler(args, optimizer, accum_steps: int, steps_per_epoch: int, ba
 # Engine step factories
 # ------------------------------------------------------------------------------------------------------------------
 
+# ------------------------------------------------------------------------------------------------------------------
+# Engine step factories
+# ------------------------------------------------------------------------------------------------------------------
+
 def _make_train_step(
     args,
     device: torch.device,
@@ -560,19 +612,25 @@ def _make_train_step(
 
     Builds and returns a closure `train_step(engine, batch)` that:
       - Runs the forward pass under AMP when enabled
-      - Computes composite loss and individual loss parts (including gaze KL parts)
-      - Selects a backward objective based on `args.gaze`:
-          * "off"      : class + rank (+ any non-gaze terms) only
-          * "use"      : class + rank + gaze KL (full objective)
-          * "use_nobp" : computes/logs gaze KL but backpropagates class + rank only
-          * "only"     : backpropagates gaze KL only (ablation/debug)
+      - Computes composite loss and individual loss parts (including gaze KL parts when enabled)
+      - Gaze behavior is controlled by `args.gaze_mode`:
+          * "off"        : no gaze used anywhere
+          * "align"      : gaze used only for KL alignment loss (model runs image-only)
+          * "guide"      : gaze injected into the transformer (no KL required)
+          * "align+guide": both injection and KL alignment
+        KL enable/disable is handled inside compute_loss via args.gaze_mode + args.attn_w.
+
+      - Weight-update behavior is controlled by `args.use_nobp`:
+          * True : compute forward + losses + metrics (including KL), but skip backward and optimizer updates
+          * False: standard training with backward + optimizer updates
+
       - Supports gradient accumulation, optional gradient clipping, optimizer stepping,
         and scheduler stepping (non-plateau schedulers only)
       - Returns a per-batch metrics dict compatible with Ignite metrics attachment
     """
     def train_step(engine, data):
         # -----------------------------
-        # User-requested hard stop
+        # Hard stop marker
         # -----------------------------
         if os.path.exists("SKIP_TRIAL"):
             print("[USER REQUEST] SKIPPING THIS RUN NOW.")
@@ -587,40 +645,29 @@ def _make_train_step(
         if logger:
             start = timer()
 
+        accum = max(1, int(accum_steps))
+        use_nobp = bool(getattr(args, "use_nobp", False))
+        use_amp = scaler.is_enabled()
+
         # -----------------------------
         # Forward pass (AMP-capable)
         # -----------------------------
-        inputs, labels = _prepare_batch(data, device)
-        use_amp = scaler.is_enabled()
+        inputs, labels = _prepare_batch(data, device, args)
 
-        with autocast(enabled=use_amp):
-            forward_dict = net(*inputs)
+        with torch.set_grad_enabled(not use_nobp):
+            with autocast(enabled=use_amp):
+                forward_dict = net(*inputs)
 
-            # Full loss + parts; parts contains raw tensors for selective backprop
-            loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
+                # Full loss + parts; KL inclusion is decided inside compute_loss via args.gaze_mode + args.attn_w
+                loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
 
-            # Class + rank objective (keeps graph)
-            loss_no_kl = parts["loss_class_raw"] + parts["loss_rank_combo_raw"]
-
-        # -----------------------------
-        # Backprop objective selection
-        # -----------------------------
-        gaze_mode = getattr(args, "gaze", "off")
-
-        DEBUG_KL_ONLY = False  # temporary debug hook
-        if DEBUG_KL_ONLY:
-            loss_bp = parts["loss_kl_weighted_raw"]
-        elif gaze_mode == "only":
-            loss_bp = parts["loss_kl_weighted_raw"]
-        elif gaze_mode == "use_nobp":
-            loss_bp = loss_no_kl
-        else:
-            loss_bp = loss_total
+                # Useful diagnostic objective (class + rank only)
+                loss_no_kl = parts["loss_class_raw"] + parts["loss_rank_combo_raw"]
 
         # -----------------------------
-        # NaN guard (check backward objective)
+        # NaN guard (check reported objective)
         # -----------------------------
-        if torch.isnan(loss_bp):
+        if torch.isnan(loss_total):
             label_r = labels["label_r"]
             n_ties = (label_r == 0).sum().item()
             n_nonties = (label_r != 0).sum().item()
@@ -633,36 +680,37 @@ def _make_train_step(
             raise ValueError("NaN loss detected; stopping for debugging.")
 
         # -----------------------------
-        # Backward pass (accumulated, AMP-safe)
+        # Backward / optimizer update
         # -----------------------------
-        raw_loss = loss_bp
-        loss_scaled = loss_bp / accum_steps
-
-        if use_amp:
-            scaler.scale(loss_scaled).backward()
-        else:
-            loss_scaled.backward()
-
-        # -----------------------------
-        # Optimizer / scheduler step (only on accumulation boundary)
-        # -----------------------------
-        if engine.state.iteration % accum_steps == 0:
-            if use_amp:
-                scaler.unscale_(optimizer)
-
-            if grad_clip is not None and grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+        if not use_nobp:
+            loss_scaled = loss_total / accum
 
             if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss_scaled).backward()
             else:
-                optimizer.step()
+                loss_scaled.backward()
 
+            # Optimizer / scheduler step (only on accumulation boundary)
+            if engine.state.iteration % accum == 0:
+                if use_amp:
+                    scaler.unscale_(optimizer)
+
+                if grad_clip is not None and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=grad_clip)
+
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+
+                optimizer.zero_grad(set_to_none=True)
+
+                if scheduler and scheduler_type != "plateau":
+                    scheduler.step()
+        else:
+            # Keep grads clean during no-backprop runs
             optimizer.zero_grad(set_to_none=True)
-
-            if scheduler and scheduler_type != "plateau":
-                scheduler.step()
 
         # -----------------------------
         # Logging output
@@ -674,13 +722,13 @@ def _make_train_step(
             args=args,
             forward_dict=forward_dict,
             labels=labels,
-            loss=raw_loss,
+            loss=loss_total.detach(),
             parts=parts,
         )
 
-        # Optional: expose both objectives for later metric work
-        #out["loss_total"] = float(loss_total.detach().item())
-        #out["loss_no_kl"] = float(loss_no_kl.detach().item())
+        # Optional: expose additional objectives for later analysis
+        # out["loss_total"] = float(loss_total.detach().item())
+        # out["loss_no_kl"] = float(loss_no_kl.detach().item())
 
         return out
 
@@ -688,51 +736,39 @@ def _make_train_step(
 
 
 def _make_inference_step(args, device: torch.device, net: torch.nn.Module):
-    
+
     """
     Ignite inference-step factory for validation/test.
 
     Builds and returns a closure `inference_step(engine, batch)` that:
       - Runs under `torch.no_grad()` (no gradients)
       - Uses AMP autocast on CUDA when enabled
-      - Computes composite loss and individual loss parts (including gaze KL parts)
-      - Reports a loss value consistent with the current `args.gaze` mode:
-          * "use_nobp" : reports class + rank (no-KL objective)
-          * "only"     : reports gaze KL objective
-          * otherwise  : reports full composite loss
+      - Computes composite loss and individual loss parts (including gaze KL parts when enabled)
+      - Reports the composite loss returned by compute_loss (KL inclusion controlled by args.gaze_mode + args.attn_w)
       - Returns a per-batch metrics dict compatible with Ignite metrics attachment
     """
     def inference_step(engine, data):
         use_amp = bool(getattr(args, "amp", False)) and bool(getattr(args, "cuda", False)) and (device.type == "cuda")
 
         with torch.no_grad():
-            inputs, labels = _prepare_batch(data, device)
+            inputs, labels = _prepare_batch(data, device, args)
 
             with autocast(enabled=use_amp):
                 forward_dict = net(*inputs)
                 loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
 
-                # Detached eval objective consistent with training objective choice
-                loss_no_kl = parts["loss_class"] + parts["loss_rank_combo"]
-
-            gaze_mode = getattr(args, "gaze", "off")
-            if gaze_mode == "use_nobp":
-                loss_report = loss_no_kl
-            elif gaze_mode == "only":
-                loss_report = parts["loss_kl_weighted"]
-            else:
-                loss_report = loss_total
-
             out = _build_metrics_output(
                 args=args,
                 forward_dict=forward_dict,
                 labels=labels,
-                loss=loss_report,
+                loss=loss_total.detach(),
                 parts=parts,
             )
 
-            #out["loss_total"] = float(loss_total.detach().item())
-            #out["loss_no_kl"] = float(loss_no_kl.detach().item())
+            # Optional: expose additional objectives for later analysis
+            # loss_no_kl = parts["loss_class"] + parts["loss_rank_combo"]
+            # out["loss_total"] = float(loss_total.detach().item())
+            # out["loss_no_kl"] = float(loss_no_kl.detach().item())
 
             return out
 
@@ -812,8 +848,10 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
             # 1. Loss (Rolling Average)
             RunningAverage(output_transform=lambda x: x["loss"], device=device).attach(engine, "loss")
             
+            gaze_mode, _use_gaze_any, use_gaze_kl, _use_gaze_inj = _resolve_gaze_flags(args)
+            
             # 2. Gaze Metrics (If enabled)
-            if args.gaze != "off":
+            if use_gaze_kl:
                 RunningAverage(output_transform=lambda x: x.get("loss_kl", 0.0), device=device).attach(engine, "loss_kl")
                 RunningAverage(output_transform=lambda x: x.get("loss_kl_weighted", 0.0), device=device).attach(engine, "loss_kl_weighted")
                 RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
@@ -845,7 +883,7 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
     Computes a confusion matrix adapted to:
     - ties=True  → 3 classes  (0=left, 1=tie, 2=right)
     - ties=False → 2 classes  (0=left, 1=right)
-    
+
     If print_output=False → do NOT print anything (useful for test set).
     """
 
@@ -861,6 +899,9 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
 
     confusion = torch.zeros(num_classes, num_classes, dtype=torch.long)
 
+    # Resolve gaze flags once (mode does not change within a run)
+    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
+
     net.eval()
     with torch.no_grad():
         for batch in loader:
@@ -868,7 +909,25 @@ def _compute_class_breakdown(args, net, loader, device, split_name: str, epoch_i
             input_right = batch["image_r"].to(device)
             label_c = batch["score_c"].to(device).long()
 
-            forward_dict = net(input_left, input_right)
+            # ---------------------------------------------------------------------------------
+            # Forward pass:
+            #   - off / align      : image-only model execution
+            #   - guide / align+guide : pass gaze + mask for injection
+            # ---------------------------------------------------------------------------------
+            if use_gaze_inj:
+                if ("gaze_l" not in batch) or ("gaze_r" not in batch):
+                    raise KeyError("Batch missing gaze tensors while gaze injection is enabled.")
+                if "has_eyetracker" not in batch:
+                    raise KeyError("Batch missing 'has_eyetracker' while gaze injection is enabled.")
+
+                gaze_l = batch["gaze_l"].to(device)
+                gaze_r = batch["gaze_r"].to(device)
+                has_eye_mask = batch["has_eyetracker"].to(device)
+
+                forward_dict = net(input_left, input_right, gaze_l, gaze_r, has_eye_mask)
+            else:
+                forward_dict = net(input_left, input_right)
+
             logits = forward_dict["logits"]["output"]
             preds = torch.argmax(logits, dim=1)
 
@@ -1230,17 +1289,11 @@ def train(
     net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
     is_transformer = hasattr(net_cfg, "transformer")
 
-    # Model-level gaze backprop safety switch (requires transformer.py support)
-    gaze_mode = getattr(args, "gaze", "off")
+    gaze_mode, _use_gaze_any, use_gaze_kl, _use_gaze_inj = _resolve_gaze_flags(args)
+    use_nobp = bool(getattr(args, "use_nobp", False))
 
-    def _set_gaze_bp(m, enabled: bool) -> None:
-        # Handles both plain modules and DataParallel/DistributedDataParallel wrappers
-        if hasattr(m, "set_gaze_backprop"):
-            m.set_gaze_backprop(enabled)
-        elif hasattr(m, "module") and hasattr(m.module, "set_gaze_backprop"):
-            m.module.set_gaze_backprop(enabled)
-
-    _set_gaze_bp(net, enabled=(gaze_mode != "use_nobp"))  # use_nobp detaches attention maps at the model level
+    # Attention-map gradient retention is only needed when KL is enabled and the run backpropagates.
+    _set_gaze_bp(net, enabled=(use_gaze_kl and (not use_nobp)))
 
     # Split params for differential LR/WD policies (head vs backbone)
     head_params, backbone_params = _split_parameters(net_cfg)

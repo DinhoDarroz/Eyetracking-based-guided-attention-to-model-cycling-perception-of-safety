@@ -63,7 +63,6 @@ def initialize_wandb(args):
             "early_stop_min_delta": getattr(args, "early_stop_min_delta", 0.0),
             "early_stop_start_epoch": getattr(args, "early_stop_start_epoch", 1),
             "dataset": args.comparisons,
-            "gaze_mode": args.gaze,
             "ties": args.ties,
             "ties_w": args.ties_w,
             "rank_w": args.rank_w,
@@ -92,6 +91,9 @@ def initialize_wandb(args):
             "resume": args.resume,
             "resume_epoch": args.epoch,
             "checkpoint": checkpoint_path,
+            "gaze_mode": str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))),
+            "use_nobp": bool(getattr(args, "use_nobp", False)),
+
         },
     )
 
@@ -328,7 +330,6 @@ def _print_filtered_dataset_summary(args, df: pd.DataFrame) -> None:
     print(df.head(3))
     print("========================================================\n")
 
-
 def _print_image_overlap_stats(
     X_train: pd.DataFrame,
     X_val: pd.DataFrame,
@@ -341,28 +342,38 @@ def _print_image_overlap_stats(
         if len(df) == 0:
             return set()
 
-        df2 = df[[c for c in [left_col, right_col, dataset_col] if c is not None and c in df.columns]].copy()
+        cols = [c for c in [left_col, right_col, dataset_col] if c is not None and c in df.columns]
+        df2 = df[cols].copy()
         df2[left_col] = df2[left_col].astype(str)
         df2[right_col] = df2[right_col].astype(str)
 
         if dataset_col is not None and dataset_col in df2.columns:
             ds = df2[dataset_col].astype(str)
-            left = (ds + "/" + df2[left_col])
-            right = (ds + "/" + df2[right_col])
+            left = ds + "/" + df2[left_col]
+            right = ds + "/" + df2[right_col]
         else:
             left = df2[left_col]
             right = df2[right_col]
 
         return set(pd.concat([left, right], ignore_index=True).tolist())
 
+    def _pct(n: int, d: int) -> float:
+        return 0.0 if d == 0 else (100.0 * n / d)
+
     tr = _unique_images(X_train)
     va = _unique_images(X_val)
     te = _unique_images(X_test)
 
-    print("Images : train=", len(tr), "| val=", len(va), "| test=", len(te))
-    print("train∩val :", len(tr & va))
-    print("train∩test:", len(tr & te))
-    print("val∩test  :", len(va & te))
+    tr_va = tr & va
+    tr_te = tr & te
+    va_te = va & te
+
+    print(f"Images : train={len(tr)} | val={len(va)} | test={len(te)}")
+
+    print(f"train∩val : {len(tr_va)} | % of train={_pct(len(tr_va), len(tr)):.2f}% | % of val={_pct(len(tr_va), len(va)):.2f}%")
+    print(f"train∩test: {len(tr_te)} | % of train={_pct(len(tr_te), len(tr)):.2f}% | % of test={_pct(len(tr_te), len(te)):.2f}%")
+    print(f"val∩test  : {len(va_te)} | % of val={_pct(len(va_te), len(va)):.2f}% | % of test={_pct(len(va_te), len(te)):.2f}%")
+
 
 
 def _print_has_eyetracker_by_split(X_train: pd.DataFrame, X_val: pd.DataFrame, X_test: pd.DataFrame) -> None:
@@ -501,6 +512,16 @@ def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs:
     grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
     return int(grid_h), int(grid_w)
 
+def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool]:
+    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+    if gaze_mode not in ("off", "align", "guide", "align+guide"):
+        gaze_mode = "off"
+
+    use_gaze_any = (gaze_mode != "off")
+    use_gaze_kl = (gaze_mode in ("align", "align+guide"))
+    use_gaze_inj = (gaze_mode in ("guide", "align+guide"))
+    return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
+
 
 def _build_transforms_and_specs(args):
     backbone_name = str(args.backbone).lower().strip()
@@ -521,18 +542,19 @@ def _build_transforms_and_specs(args):
     args.gaze_grid_size = (int(grid_h), int(grid_w))
     args.gaze_map_size_int = int(grid_h)
 
-    use_gaze_requested = (str(getattr(args, "gaze", "off")).lower().strip() != "off")
+    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
+    args.gaze_mode = gaze_mode
 
     use_gaze_loss = (
         str(getattr(args, "model", "")).lower().strip() == "rsscnn"
-        and use_gaze_requested
+        and use_gaze_kl
         and float(getattr(args, "attn_w", 0.0) or 0.0) > 0.0
     )
 
     eval_tfms, eval_meta = build_eval_transforms(
         model_specs,
         gaze_grid_size=args.gaze_grid_size,
-        enable_gaze=use_gaze_requested,
+        enable_gaze=use_gaze_any,
     )
 
     augment_level = str(getattr(args, "augment", "none")).lower().strip()
@@ -552,14 +574,14 @@ def _build_transforms_and_specs(args):
             interpolation=_get_interp_mode(eval_meta["interpolation"]),
             mean=tuple(eval_meta["mean"]),
             std=tuple(eval_meta["std"]),
-            enable_gaze=use_gaze_requested,
+            enable_gaze=use_gaze_any,
             gaze_grid_size=tuple(args.gaze_grid_size),
             **preset,
         )
         train_meta = {
             "train_policy": f"pairwise augmentation ({augment_level})",
             "augment": augment_level,
-            "gaze_aware": bool(use_gaze_requested),
+            "gaze_aware": bool(use_gaze_any),
             "params": dict(preset),
         }
 
@@ -570,8 +592,12 @@ def _build_transforms_and_specs(args):
         "backbone_family": "cnn" if is_cnn_backbone else "transformer",
         "model_specs": dict(model_specs),
         "gaze": {
-            "requested": bool(use_gaze_requested),
+            "mode": str(getattr(args, "gaze_mode", "off")),
+            "requested": bool(use_gaze_any),
             "use_gaze_loss": bool(use_gaze_loss),
+            "use_gaze_kl": bool(use_gaze_kl),
+            "use_gaze_injection": bool(use_gaze_inj),
+            "use_nobp": bool(getattr(args, "use_nobp", False)),
             "grid_size": tuple(args.gaze_grid_size),
         },
         "eval": dict(eval_meta),
@@ -580,11 +606,13 @@ def _build_transforms_and_specs(args):
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
 
+    use_gaze_requested = bool(use_gaze_any)
     return backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone
 
 
 def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tfms):
-    use_gaze = (str(getattr(args, "gaze", "off")).lower().strip() != "off")
+    
+    use_gaze = (str(getattr(args, "gaze_mode", "off")).lower().strip() != "off")
 
     train_set = ComparisonsDataset(
         dataframe=X_train,
@@ -633,6 +661,14 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         known = TRANSFORMER_BACKBONES + CNN_BACKBONES
         raise ValueError(f"Invalid backbone '{args.backbone}'. Available: {known}")
 
+    # ----------------------------------------------------------------------------------------------
+    # Resolve gaze interface into explicit booleans
+    # ----------------------------------------------------------------------------------------------
+    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
+
+    # ----------------------------------------------------------------------------------------------
+    # CNN backbones
+    # ----------------------------------------------------------------------------------------------
     if is_cnn_backbone:
         from nets.cnn import CNN as Net
         from torchvision import models
@@ -657,6 +693,9 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         )
         return net
 
+    # ----------------------------------------------------------------------------------------------
+    # Transformer backbones
+    # ----------------------------------------------------------------------------------------------
     from nets.transformer import Transformer as Net
 
     net = Net(
@@ -674,10 +713,13 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         attention_mode=args.attention_mode,
         attn_topk=args.attn_topk,
         attn_out_hw=tuple(getattr(args, "gaze_grid_size", (14, 14))),
+        use_gaze_injection=bool(use_gaze_inj),
     )
 
+    # Logging/compat flag used elsewhere
     net.attn_grad = bool(use_gaze_loss)
 
+    # Ensure attention maps match gaze grid resolution when KL supervision is active
     if use_gaze_loss:
         try:
             from dataclasses import replace
@@ -723,3 +765,32 @@ def _cleanup_between_trials(args, net, train_loader, val_loader, test_loader) ->
     gc.collect()
     if args.cuda and torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+def scale_lr_and_eta_min_by_unfrozen_blocks(
+    args,
+    *,
+    lr_01: float | None = None,
+    lr_other: float = 2e-5,
+    eta_other: float = 5e-6,
+    scale_eta_min: bool = True,
+) -> tuple[float, float]:
+    base_lr = float(getattr(args, "base_lr", 0.0))
+    eta_min = float(getattr(args, "eta_min", 0.0))
+    finetune = bool(getattr(args, "finetune", False))
+    n = int(getattr(args, "num_ft_blocks", 0))
+
+    if lr_01 is None:
+        lr_01 = base_lr
+
+    if (not finetune) or (n <= 1):
+        new_lr = float(lr_01)
+        if scale_eta_min and base_lr > 0.0:
+            scale = new_lr / base_lr
+            new_eta = eta_min * scale
+        else:
+            new_eta = eta_min
+    else:
+        new_lr = float(lr_other)
+        new_eta = float(eta_other)
+
+    return new_lr, new_eta

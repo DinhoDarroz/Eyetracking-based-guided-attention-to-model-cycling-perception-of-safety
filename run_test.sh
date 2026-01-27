@@ -10,13 +10,12 @@ VENV_PATH=".venv"
 # ----------------------------------
 # Test configuration
 # ----------------------------------
-RUN_NAME="6f92g02q"
-CHECKPOINT="astral-sweep-1_best_model_5_0.7708.pt"
+RUN_NAME="dj8rhkwg"
+CHECKPOINT="different-sweep-7_best_model_4_0.7806.pt"
 #TEST_SET="comparisons_df_with_synthetic_berlin.pickle"
-TEST_SET="build_datasets/comparisons_tests.pkl"
+TEST_SET="build_datasets/datasets/comparisons_tests.pkl"
 DATASET_DIR="images/printart/subjectivesafety_images"
-CITIES="berlin"
-
+CITIES="berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov" 
 PYTHON_SCRIPT="test.py"
 
 # ----------------------------------
@@ -43,7 +42,7 @@ python "$PYTHON_SCRIPT" \
 
 echo "Test finished: $RUN_NAME ($TEST_SET)"
 
-#"berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov" \
+
 #python "$PYTHON_SCRIPT" \
 #    --comparisons "$TEST_SET" \
 #    --dataset images/printart/subjectivesafety_images \

@@ -719,9 +719,12 @@ def print_run_plan(
             print(f"  attn_topk    : {getattr(args, 'attn_topk', 'all')}")
 
     print(f"  augment      : {args.augment}")
-    print(f"  finetune     : {args.finetune}")
-    if args.finetune:
+    finetune_on = bool(getattr(args, "finetune", False)) and int(getattr(args, "num_ft_blocks", 0)) > 0
+    
+    print(f"  finetune     : {finetune_on}")
+    if finetune_on:
         print(f"  num_ft_blocks: {args.num_ft_blocks}")
+
 
     # ---------------------------------------------------------------------------------------------
     # Batching / throughput

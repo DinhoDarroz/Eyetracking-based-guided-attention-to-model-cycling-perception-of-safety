@@ -2,7 +2,7 @@
 # W&B Sweep: 5 Backbones + Unfreeze Depth + Pooling + Augmentation
 # ==============================================================================
 program: /home/csantiago/train.py
-project: PCS_ET_v2
+project: PCS_ET_v22
 command:
   - python
   - ${program}
@@ -20,7 +20,7 @@ parameters:
   cuda:
     value: true
   cuda_id:
-    value: 0
+    value: 1
   amp:
     value: false
   
@@ -53,7 +53,7 @@ parameters:
   # B) Dataset / Filtering
   # ---------------------------------------------------------------------------
   cities:
-    value: "berlin"
+    value: "berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
 
   # ---------------------------------------------------------------------------
   # C) Model family / Objective
@@ -62,7 +62,7 @@ parameters:
     value: rsscnn
   ties:
     value: false
-  gaze:
+  gaze_mode:
     values: ["off"]
 
   # ---------------------------------------------------------------------------
@@ -120,7 +120,7 @@ parameters:
   # G) Optimizer
   # ---------------------------------------------------------------------------
   base_lr:
-    values: [2e-5]
+    value: 4e-4
   backbone_lr_scale:
     value: 1
   weight_decay:
@@ -138,6 +138,7 @@ parameters:
   # ---------------------------------------------------------------------------
   ranking_margin:
     values: [0.4]
+
 #  ranking_margin_ties:
 #    value: 0.7
   rank_w:
@@ -180,13 +181,13 @@ parameters:
   # L) Early stopping
   # ---------------------------------------------------------------------------
   early_stop:
-    value: false
+    value: true
   early_stop_metric:
     value: loss_validation
   early_stop_mode:
     value: min
   early_stop_patience:
-    value: 3
+    value: 4
   early_stop_min_delta:
     value: 0.0
   early_stop_start_epoch:

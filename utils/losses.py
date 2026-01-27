@@ -486,12 +486,16 @@ def compute_loss(
         # 4.3) Gaze KL (optional)
         # -----------------------------------------------------------------
         w_kl = float(getattr(args, "attn_w", 0.0) or 0.0)
-        gaze_mode = getattr(args, "gaze", "use")
+        gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+        if gaze_mode not in ("off", "align", "guide", "align+guide"):
+            gaze_mode = "off"
+
+        use_gaze_kl = (gaze_mode in ("align", "align+guide"))
 
         gaze_any = False
         gaze_count = 0
 
-        if (gaze_mode == "off") or (w_kl <= 0.0):
+        if (not use_gaze_kl) or (w_kl <= 0.0):
             loss_kl = loss_class.new_zeros(())
             w_kl_eff = 0.0
         else:
@@ -502,6 +506,11 @@ def compute_loss(
             if ("attn_map" not in network_output_dict["left"]) or ("attn_map" not in network_output_dict["right"]):
                 raise KeyError("network_output_dict['left/right']['attn_map'] missing.")
 
+            attn_l = network_output_dict["left"]["attn_map"]
+            attn_r = network_output_dict["right"]["attn_map"]
+            if (attn_l is None) or (attn_r is None):
+                raise ValueError("Attention maps are None while gaze KL is enabled.")
+
             has_eye_mask = labels["has_eye_mask"]  # BoolTensor [B]
             gaze_count = int(has_eye_mask.long().sum().item())
             gaze_any = bool(has_eye_mask.any().item())
@@ -511,8 +520,8 @@ def compute_loss(
                 w_kl_eff = 0.0
             else:
                 loss_kl = attention_kl_loss(
-                    network_output_dict["left"]["attn_map"],
-                    network_output_dict["right"]["attn_map"],
+                    attn_l,
+                    attn_r,
                     labels["gaze_l"],
                     labels["gaze_r"],
                     has_mask=has_eye_mask,
@@ -541,6 +550,10 @@ def compute_loss(
             "w_kl_eff": float(w_kl_eff),
             "gaze_any": float(gaze_any),
             "gaze_count": gaze_count,
+
+            "gaze_mode": str(gaze_mode),
+            "use_gaze_kl": float(use_gaze_kl),
+
         }
         return _ret(total, parts)
 

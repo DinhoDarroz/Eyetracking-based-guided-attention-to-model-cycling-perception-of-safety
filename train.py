@@ -42,6 +42,7 @@ from train_main_utils import (
     _maybe_wrap_dataparallel,
     _maybe_resume,
     _cleanup_between_trials,
+    scale_lr_and_eta_min_by_unfrozen_blocks,
 )
 
 from scripts.train_script import train
@@ -153,17 +154,27 @@ def arg_parse():
 
     # -------------------- GAZE & CITY FILTERS ----------------
     parser.add_argument(
-    "--gaze",
+        "--gaze_mode",
         default="off",
-        choices=["off", "use", "use_nobp", "only"],
+        choices=["off", "align", "guide", "align+guide"],
         help=(
-            "Gaze supervision mode:\n"
-            "  off       : do not use gaze loss\n"
-            "  use       : use gaze KL in total loss (backprop)\n"
-            "  use_nobp  : compute/log gaze KL but DO NOT backprop KL\n"
-            "  only      : train using gaze KL only (debug/ablation)\n"
+            "Gaze usage mode:\n"
+            "  off         : do not use gaze anywhere\n"
+            "  align       : use gaze only for KL alignment loss (model runs image-only)\n"
+            "  guide       : inject gaze into the transformer (no KL required)\n"
+            "  align+guide : both injection and KL alignment\n"
         ),
     )
+
+    parser.add_argument(
+        "--use_nobp",
+        nargs="?",
+        const=True,
+        default=False,
+        type=str2bool,
+        help="If True, compute forward/loss/metrics but skip backward and optimizer updates.",
+    )
+
 
     parser.add_argument("--attention_mode", type=str, default="last", choices=["last", "rollout", "topk"],
     help=(
@@ -313,11 +324,30 @@ def run_training_with_args(args, trial=None):
     Runs one full training session given a filled args Namespace.
     Returns best validation accuracy from train().
     """
+    # ----------------------------------------------------------------------------------------------
+    # Gaze mode normalization (new interface) + backward-compatible alias (legacy: args.gaze)
+    # ----------------------------------------------------------------------------------------------
+    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+    if gaze_mode not in ("off", "align", "guide", "align+guide"):
+        gaze_mode = "off"
+    args.gaze_mode = gaze_mode
+
+    use_nobp = bool(getattr(args, "use_nobp", False))
+    args.use_nobp = use_nobp
+
+    # Legacy alias used by existing validation/logging paths until all modules are migrated.
+    if gaze_mode == "off":
+        args.gaze = "off"
+    elif gaze_mode == "guide":
+        args.gaze = "off"
+    else:
+        args.gaze = "use_nobp" if use_nobp else "use"
 
     # ==============================================================================================
     # 0) ARG VALIDATION / NORMALIZATION
     # ==============================================================================================
     validate_and_normalize_args(args, strict=False, verbose=True)
+    args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=2e-5)
 
     print("=== Args ===")
     print(args, "\n")
@@ -351,10 +381,10 @@ def run_training_with_args(args, trial=None):
         df=comparisons_df,
         seed=args.seed,
         comparisons_path=args.comparisons,
-        splits_dir="nahs",
-        train_pct=0.95,
-        val_pct=0.0025,
-        test_pct=0.0475,
+        splits_dir="splits_yolo",
+        train_pct=0.7,
+        val_pct=0.1,
+        test_pct=0.2,
         load_if_exists=True,   # loads if files exist, otherwise splits
     )
 
