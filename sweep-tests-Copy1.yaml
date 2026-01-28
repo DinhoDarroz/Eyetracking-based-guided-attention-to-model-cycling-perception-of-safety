@@ -69,9 +69,9 @@ parameters:
   backbone:
     values:
       #- "vit_small"
-      #- "dinov3_vitb16"
+      - "dinov3_vitb16"
       #- "deit3_base_patch16_224"
-      - "vit_base_patch16_224"
+      #- "vit_base_patch16_224"
       #- "vit_base_patch16_clip_224"
     
 
@@ -195,7 +195,7 @@ parameters:
   # Gaze Configuration
   # ---------------------------------------------------------------------------
   gaze_mode:
-    values: ["guide", "off", "align"]
+    values: ["guide", "off", "aligned", "align+guide"]
     
   gaze_map_size:
     value: "auto"    # Options: "auto" or an integer (e.g., 14, 16)

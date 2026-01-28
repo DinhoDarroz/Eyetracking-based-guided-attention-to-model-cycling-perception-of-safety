@@ -644,8 +644,11 @@ class GIIInjectorLayer(nn.Module):
         z_hat_v_prime = z_hat_v * a                       # (B,P,db)
 
         z_hat_prime = torch.cat([z_hat_c, z_hat_v_prime], dim=1)  # (B,N,db)
-        z_bar = self.up(z_hat_prime)                                # (B,N,D)
-
+        z_bar = self.up(z_hat_prime)                              # (B,N,D)
+        
+        p_mask_ = p_mask.to(device=z_bar.device, dtype=z_bar.dtype)  # (B,1,1)
+        z_bar = z_bar * p_mask_                                       # (B,N,D)
+        
         return float(self.cfg.strength) * z_bar
 
 
@@ -690,7 +693,7 @@ def forward_backbone_tokens(
     backbone: nn.Module,
     x: torch.Tensor,
     attention_recorder: Optional[Any] = None,
-    gaze_embedder: Optional[GazeTokenEmbedder] = None,
+    gaze_embedder: Optional["GazeTokenEmbedder"] = None,
     gii_layers: Optional[nn.ModuleList] = None,
     gaze_map: Optional[torch.Tensor] = None,
     has_eye_mask: Optional[torch.Tensor] = None,
@@ -698,132 +701,86 @@ def forward_backbone_tokens(
     guidance_drop_prob: float = 0.0,
 ) -> torch.Tensor:
     """
-    If gaze_embedder + gii_layers + gaze_map are provided, runs an explicit ViT-style loop:
+    Guidance implementation that preserves the backbone's native forward_features behavior.
 
-      z_tilde = x + DropPath( Attn( Norm1(x) ) )
-      z_ffn   = z_tilde + DropPath( MLP( Norm2(z_tilde) ) )
-      x       = z_ffn + bar_z( z_tilde, gaze )
-
-    Otherwise, falls back to backbone.forward_features/backbone(x).
+    - If guidance is disabled or no gaze is present in the batch: uses backbone.forward_features/backbone(x)
+    - If guidance is enabled and gaze exists: registers per-block forward hooks that add GII residuals
+      to the block outputs, then runs backbone.forward_features/backbone(x) normally.
     """
+    blocks = getattr(backbone, "blocks", None)
+
+    # Determine whether any sample in the batch has gaze available
+    has_any_gaze = True
+    if has_eye_mask is not None:
+        has_any_gaze = bool(has_eye_mask.to(torch.bool).any().item())
+
     guidance_enabled = (
         (gii_layers is not None)
         and (gaze_embedder is not None)
         and (gaze_map is not None)
+        and (blocks is not None)
         and (len(gii_layers) > 0)
+        and has_any_gaze
     )
 
+    # Fallback: native backbone forward
     if not guidance_enabled:
         feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)
         return _normalize_backbone_output(feats)
 
-    patch_embed = getattr(backbone, "patch_embed", None)
-    blocks = getattr(backbone, "blocks", None)
-    norm = getattr(backbone, "norm", None)
+    b = int(x.shape[0])
 
-    if (patch_embed is None) or (blocks is None):
-        feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)
-        return _normalize_backbone_output(feats)
+    # Patch grid inferred from backbone config; works with DINOv3 and other timm ViTs
+    grid_hw = infer_patch_grid(backbone, num_patches=None)
 
-    tok = patch_embed(x)
-    
-    if tok.ndim == 4:
-        # patch_embed may return:
-        #   - NCHW: (B, D, Gh, Gw)
-        #   - NHWC: (B, Gh, Gw, D)
-        cls_token = getattr(backbone, "cls_token", None)
-        d_ref = int(cls_token.shape[-1]) if torch.is_tensor(cls_token) else None
-    
-        if d_ref is not None and tok.shape[-1] == d_ref:
-            # NHWC -> (B, P, D)
-            b, gh, gw, d = tok.shape
-            tok = tok.view(b, gh * gw, d).contiguous()
-        else:
-            # NCHW -> (B, P, D)
-            b, d, gh, gw = tok.shape
-            tok = tok.flatten(2).transpose(1, 2).contiguous()
-    
-    b, p, _ = tok.shape
-
-    cls_token = getattr(backbone, "cls_token", None)
-    dist_token = getattr(backbone, "dist_token", None)
-    reg_token = getattr(backbone, "reg_token", None)
-
-    prefix: List[torch.Tensor] = []
-    if cls_token is not None and torch.is_tensor(cls_token):
-        prefix.append(cls_token.expand(b, -1, -1))
-    if dist_token is not None and torch.is_tensor(dist_token):
-        prefix.append(dist_token.expand(b, -1, -1))
-    if reg_token is not None and torch.is_tensor(reg_token):
-        rt = reg_token if reg_token.ndim == 3 else reg_token.unsqueeze(0)
-        prefix.append(rt.expand(b, -1, -1))
-
-    if len(prefix) > 0:
-        pref = torch.cat(prefix, dim=1)
-        tok = torch.cat([pref, tok], dim=1)
-
-    pos_embed = getattr(backbone, "pos_embed", None)
-    if pos_embed is not None and torch.is_tensor(pos_embed):
-        if pos_embed.shape[1] == tok.shape[1]:
-            tok = tok + pos_embed
-        else:
-            tok = tok + pos_embed[:, : tok.shape[1], :]
-
-    pos_drop = getattr(backbone, "pos_drop", None)
-    if isinstance(pos_drop, nn.Module):
-        tok = pos_drop(tok)
-
-    t = int(num_prefix_tokens)
-    grid_hw = infer_patch_grid(backbone, num_patches=p)
-
+    # Per-sample mask p in {0,1} with optional stochastic dropping during training
     p_mask = _gaze_presence_mask(
         b=b,
         has_eye_mask=has_eye_mask,
         drop_prob=float(guidance_drop_prob),
         training=bool(backbone.training),
-        device=tok.device,
+        device=x.device,
     )
 
+    # Embed gaze once for the whole forward
     gaze_tokens = gaze_embedder(gaze_map, grid_hw=grid_hw)  # (B,P,dg)
 
-    for i, blk in enumerate(blocks):
-        if i >= len(gii_layers):
-            tok = blk(tok)
-            continue
+    hooks: List[Any] = []
 
-        # Falls back to the original block forward when the structure does not match timm ViT blocks.
-        if not (hasattr(blk, "norm1") and hasattr(blk, "attn") and hasattr(blk, "norm2") and hasattr(blk, "mlp")):
-            tok = blk(tok)
-            continue
+    def _make_block_hook(layer_idx: int):
+        def _hook(module: nn.Module, inputs: Tuple[torch.Tensor, ...], output: Any):
+            # Some implementations may return tuples; only tensor outputs are supported for injection.
+            if not torch.is_tensor(output):
+                return output
 
-        y = blk.attn(blk.norm1(tok))
-        y = _maybe_layer_scale(blk, which=1, x=y)
-        dp1 = _resolve_drop_path(blk, which=1)
-        if isinstance(dp1, nn.Module):
-            y = dp1(y)
-        z_tilde = tok + y
+            # GII expects tokens shaped (B,N,D). Use block output as z_tilde surrogate.
+            z_tilde = output
 
-        y2 = blk.mlp(blk.norm2(z_tilde))
-        y2 = _maybe_layer_scale(blk, which=2, x=y2)
-        dp2 = _resolve_drop_path(blk, which=2)
-        if isinstance(dp2, nn.Module):
-            y2 = dp2(y2)
-        z_ffn = z_tilde + y2
+            z_bar = gii_layers[layer_idx](
+                z_tilde=z_tilde,
+                gaze_tokens=gaze_tokens,
+                p_mask=p_mask,
+                num_prefix_tokens=int(num_prefix_tokens),
+                grid_hw=grid_hw,
+            )
+            return output + z_bar
+        return _hook
 
-        z_bar = gii_layers[i](
-            z_tilde=z_tilde,
-            gaze_tokens=gaze_tokens,
-            p_mask=p_mask,
-            num_prefix_tokens=t,
-            grid_hw=grid_hw,
-        )
+    # Attach hooks for the layers that have injectors
+    n_hook = min(len(blocks), len(gii_layers))
+    for i in range(n_hook):
+        hooks.append(blocks[i].register_forward_hook(_make_block_hook(i)))
 
-        tok = z_ffn + z_bar
+    try:
+        feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)
+    finally:
+        for h in hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
 
-    if isinstance(norm, nn.Module):
-        tok = norm(tok)
-
-    return tok
+    return _normalize_backbone_output(feats)
 
 
 # ================================================================================================

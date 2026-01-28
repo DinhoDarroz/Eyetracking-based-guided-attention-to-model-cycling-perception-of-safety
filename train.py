@@ -332,7 +332,7 @@ def run_training_with_args(args, trial=None):
     # 0) ARG VALIDATION / NORMALIZATION
     # ==============================================================================================
     validate_and_normalize_args(args, strict=False, verbose=True)
-    args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=7e-5)
+    args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=2e-5)
 
     print("=== Args ===")
     print(args, "\n")
