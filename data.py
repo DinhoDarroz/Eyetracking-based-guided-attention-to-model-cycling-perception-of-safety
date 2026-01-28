@@ -42,8 +42,7 @@ class ComparisonsDataset(Dataset):
         gaze_root: Optional[str] = None,
         use_gaze: bool = True,
         use_seg: bool = False,
-        map_size: int = 14,
-        gaze_subdir_fmt: str = "{s}x{s}",
+ 
     ):
         """
         Args:
@@ -69,10 +68,6 @@ class ComparisonsDataset(Dataset):
         self.use_gaze = bool(use_gaze)
         self.use_seg = bool(use_seg)
     
-        # Which on-disk gaze resolution folder to use (e.g., 14x14, 16x16)
-        self.map_size = int(map_size)
-        self.gaze_subdir_fmt = str(gaze_subdir_fmt)
-    
         # Collation-safe dummy gaze. Keep it minimal; transforms will expand/resize as needed.
         # Using 1x1 avoids silently “pretending” gaze is 14x14 when it might not be.
         self._gaze_dummy = torch.zeros((1, 1, 1), dtype=torch.float32)
@@ -88,25 +83,21 @@ class ComparisonsDataset(Dataset):
     def _resolve_gaze_path(self, fname: Optional[str]) -> str:
         """
         Resolves gaze path.
-    
-        If fname is relative and gaze_root is provided:
-            gaze_root / <subdir_for_map_size> / fname
-        where <subdir_for_map_size> defaults to "{s}x{s}" -> "14x14", "16x16", ...
-    
+
         If fname is absolute, keep it.
+        If fname is relative and gaze_root is provided:
+            gaze_root / fname
         """
         if not fname:
             return ""
-    
-        # Absolute paths bypass gaze_root/subdir logic
+
         if os.path.isabs(fname):
             return fname
-    
+
         if self.gaze_root is None:
-            return fname  # relative but no root given
-    
-        subdir = self.gaze_subdir_fmt.format(s=self.map_size)
-        return os.path.join(self.gaze_root, subdir, fname)
+            return fname
+
+        return os.path.join(self.gaze_root, fname)
 
 
     def _load_gaze_npy(self, fname: Optional[str]) -> Tuple[torch.Tensor, bool]:
@@ -261,7 +252,9 @@ class ResizeCenterCropAlignGaze:
       - Resize images by short side (aspect ratio preserved)
       - Center crop images to a fixed square
       - If enable_gaze=True:
-          - if has_eyetracker=True: resize + crop gaze to match image geometry, then downsample to gaze_grid_size
+          - if has_eyetracker=True: resize + crop gaze to match image geometry
+            - gaze_output="align": downsample to gaze_grid_size
+            - gaze_output="guide": keep at target_crop x target_crop
           - else: create a fixed-shape dummy gaze tensor for collation safety
       - If enable_gaze=False: do not create, modify, or delete any gaze keys
     """
@@ -273,12 +266,18 @@ class ResizeCenterCropAlignGaze:
         img_interp,
         gaze_grid_size,
         enable_gaze: bool = True,
+        gaze_output: str = "align",  # "align" or "guide"
     ):
         self.resize_dim = int(resize_dim)
         self.target_crop = int(target_crop)
         self.img_interp = img_interp
         self.gaze_grid_size = (int(gaze_grid_size[0]), int(gaze_grid_size[1]))
         self.enable_gaze = bool(enable_gaze)
+
+        gaze_output = str(gaze_output).strip().lower()
+        if gaze_output not in ("align", "guide"):
+            raise ValueError(f"gaze_output must be 'align' or 'guide', got: {gaze_output}")
+        self.gaze_output = gaze_output
 
     @staticmethod
     def _as_bool(x) -> bool:
@@ -313,6 +312,11 @@ class ResizeCenterCropAlignGaze:
         x = nnF.interpolate(x, size=tuple(size_hw), mode="bilinear", align_corners=False)
         return x.squeeze(0).contiguous()  # [1,H2,W2]
 
+    def _gaze_out_hw(self) -> Tuple[int, int]:
+        if self.gaze_output == "align":
+            return self.gaze_grid_size
+        return (self.target_crop, self.target_crop)
+
     def _process_side(self, sample: dict, side: str) -> None:
         img_key = f"image_{side}"
         gaze_key = f"gaze_{side}"
@@ -334,22 +338,28 @@ class ResizeCenterCropAlignGaze:
         if not self.enable_gaze:
             return
 
+        out_hw = self._gaze_out_hw()
+
         has_real_gaze = self._as_bool(sample.get("has_eyetracker", False))
         if not has_real_gaze:
-            sample[gaze_key] = torch.zeros((1, *self.gaze_grid_size), dtype=torch.float32)
+            sample[gaze_key] = torch.zeros((1, out_hw[0], out_hw[1]), dtype=torch.float32)
             return
 
-        # 4) Align gaze to resized image geometry, then crop and downsample
+        # 4) Align gaze to resized image geometry, then crop; optional final resize depends on mode
         g = self._to_1ch_float(sample[gaze_key])
         g = self._resize_gaze(g, size_hw=(h, w))  # match resized image H,W
         g = TF.center_crop(g, [self.target_crop, self.target_crop])
-        g = self._resize_gaze(g, size_hw=self.gaze_grid_size)  # supervision grid
+
+        if self.gaze_output == "align":
+            g = self._resize_gaze(g, size_hw=out_hw)  # supervision grid
+
         sample[gaze_key] = g
 
     def __call__(self, sample: dict) -> dict:
         self._process_side(sample, "l")
         self._process_side(sample, "r")
         return sample
+
 
 
 def _get_interp_mode(mode_str):
@@ -369,7 +379,13 @@ def _get_interp_mode(mode_str):
 
     return mapping[mode_str]
 
-def build_eval_transforms(specs: dict, gaze_grid_size=(14, 14), enable_gaze: bool = True):
+def build_eval_transforms(
+    specs: dict,
+    gaze_grid_size=(14, 14),
+    enable_gaze: bool = True,
+    gaze_output: str = "align",  # "align" or "guide"
+):
+
     """
     Build deterministic validation/test preprocessing.
 
@@ -404,11 +420,18 @@ def build_eval_transforms(specs: dict, gaze_grid_size=(14, 14), enable_gaze: boo
                 img_interp=img_interp,
                 gaze_grid_size=gaze_grid_size,
                 enable_gaze=bool(enable_gaze),
+                gaze_output=str(gaze_output),
             ),
             transforms.Lambda(_to_tensor_and_normalize_pair),
         ]
     )
 
+    gaze_output_norm = str(gaze_output).lower().strip()
+    
+    gaze_policy = "if enable_gaze: Resize(match,gaze)->CenterCrop(gaze)"
+    if gaze_output_norm == "align":
+        gaze_policy += "->ResizeDown(gaze)"
+    
     meta = {
         "target_crop": target_crop,
         "resize_dim": resize_dim,
@@ -418,12 +441,14 @@ def build_eval_transforms(specs: dict, gaze_grid_size=(14, 14), enable_gaze: boo
         "std": std,
         "gaze_grid_size": tuple(gaze_grid_size),
         "enable_gaze": bool(enable_gaze),
+        "gaze_output": str(gaze_output),
         "eval_policy": (
             "Resize(short,img) -> CenterCrop(img); "
-            "if enable_gaze: Resize(match,gaze)->CenterCrop(gaze)->ResizeDown(gaze); "
+            f"{gaze_policy}; "
             "ToTensor/Norm(img)"
         ),
     }
+
     return eval_tfms, meta
 
 # =============================================================================================== #
@@ -545,6 +570,8 @@ class Augmentation:
 
         enable_gaze: bool = False,
         gaze_grid_size=(14, 14),
+        gaze_output: str = "align",  # "align" or "guide" (also accepts "align+guide")
+
 
         paired_scale: bool = True,
         paired_hflip: bool = True,
@@ -601,6 +628,14 @@ class Augmentation:
         self.enable_gaze = bool(enable_gaze)
         self.gaze_grid_size = (int(gaze_grid_size[0]), int(gaze_grid_size[1]))
 
+        gaze_output = str(gaze_output).lower().strip()
+        if gaze_output == "align+guide":
+            gaze_output = "guide"
+        if gaze_output not in ("align", "guide"):
+            gaze_output = "align"
+        self.gaze_output = gaze_output
+
+
         self.paired_scale = bool(paired_scale)
         self.paired_hflip = bool(paired_hflip)
         self.paired_crop = bool(paired_crop)
@@ -630,6 +665,11 @@ class Augmentation:
     # -------------------------
     # Small utilities
     # -------------------------
+    def _gaze_out_hw(self):
+        if self.gaze_output == "align":
+            return self.gaze_grid_size
+        return (self.out_size, self.out_size)
+
     @staticmethod
     def _as_bool(x) -> bool:
         if torch.is_tensor(x):
@@ -1066,39 +1106,53 @@ class Augmentation:
 
         # Gaze output
         if self.enable_gaze:
+            out_h, out_w = self._gaze_out_hw()
+
             if (not has_eye) or (g_l is None) or (g_r is None):
-                sample["gaze_l"] = torch.zeros((1, *self.gaze_grid_size), dtype=torch.float32)
-                sample["gaze_r"] = torch.zeros((1, *self.gaze_grid_size), dtype=torch.float32)
+                sample["gaze_l"] = torch.zeros((1, out_h, out_w), dtype=torch.float32)
+                sample["gaze_r"] = torch.zeros((1, out_h, out_w), dtype=torch.float32)
             else:
-                g_l = self._downsample_gaze_to_grid(g_l)
-                g_r = self._downsample_gaze_to_grid(g_r)
+                if self.gaze_output == "align":
+                    # Final downsample to transformer/CNN attention grid
+                    g_l = self._downsample_gaze_to_grid(g_l)
+                    g_r = self._downsample_gaze_to_grid(g_r)
 
-                gh, gw = self.gaze_grid_size
-                if erase_rect_l is not None:
-                    top, left, eh, ew = erase_rect_l
-                    y0 = int(math.floor(top * gh / self.out_size))
-                    x0 = int(math.floor(left * gw / self.out_size))
-                    y1 = int(math.ceil((top + eh) * gh / self.out_size))
-                    x1 = int(math.ceil((left + ew) * gw / self.out_size))
-                    y0 = max(0, min(gh, y0))
-                    y1 = max(0, min(gh, y1))
-                    x0 = max(0, min(gw, x0))
-                    x1 = max(0, min(gw, x1))
-                    if y1 > y0 and x1 > x0:
-                        g_l[:, y0:y1, x0:x1] = 0.0
+                    gh, gw = self.gaze_grid_size
 
-                if erase_rect_r is not None:
-                    top, left, eh, ew = erase_rect_r
-                    y0 = int(math.floor(top * gh / self.out_size))
-                    x0 = int(math.floor(left * gw / self.out_size))
-                    y1 = int(math.ceil((top + eh) * gh / self.out_size))
-                    x1 = int(math.ceil((left + ew) * gw / self.out_size))
-                    y0 = max(0, min(gh, y0))
-                    y1 = max(0, min(gh, y1))
-                    x0 = max(0, min(gw, x0))
-                    x1 = max(0, min(gw, x1))
-                    if y1 > y0 and x1 > x0:
-                        g_r[:, y0:y1, x0:x1] = 0.0
+                    if erase_rect_l is not None:
+                        top, left, eh, ew = erase_rect_l
+                        y0 = int(math.floor(top * gh / self.out_size))
+                        x0 = int(math.floor(left * gw / self.out_size))
+                        y1 = int(math.ceil((top + eh) * gh / self.out_size))
+                        x1 = int(math.ceil((left + ew) * gw / self.out_size))
+                        y0 = max(0, min(gh, y0))
+                        y1 = max(0, min(gh, y1))
+                        x0 = max(0, min(gw, x0))
+                        x1 = max(0, min(gw, x1))
+                        if y1 > y0 and x1 > x0:
+                            g_l[:, y0:y1, x0:x1] = 0.0
+
+                    if erase_rect_r is not None:
+                        top, left, eh, ew = erase_rect_r
+                        y0 = int(math.floor(top * gh / self.out_size))
+                        x0 = int(math.floor(left * gw / self.out_size))
+                        y1 = int(math.ceil((top + eh) * gh / self.out_size))
+                        x1 = int(math.ceil((left + ew) * gw / self.out_size))
+                        y0 = max(0, min(gh, y0))
+                        y1 = max(0, min(gh, y1))
+                        x0 = max(0, min(gw, x0))
+                        x1 = max(0, min(gw, x1))
+                        if y1 > y0 and x1 > x0:
+                            g_r[:, y0:y1, x0:x1] = 0.0
+
+                else:
+                    # guide: keep gaze at out_size x out_size (same as model image input)
+                    if erase_rect_l is not None:
+                        top, left, eh, ew = erase_rect_l
+                        g_l[:, top:top + eh, left:left + ew] = 0.0
+                    if erase_rect_r is not None:
+                        top, left, eh, ew = erase_rect_r
+                        g_r[:, top:top + eh, left:left + ew] = 0.0
 
                 sample["gaze_l"] = g_l
                 sample["gaze_r"] = g_r

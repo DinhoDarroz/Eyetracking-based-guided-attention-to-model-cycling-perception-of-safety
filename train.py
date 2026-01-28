@@ -284,8 +284,7 @@ def arg_parse():
     parser.add_argument("--label_smoothing", type=float, default=0)
     parser.add_argument("--attn_w", type=float, default=1.0)
     parser.add_argument("--gaze_root", type=str, default="Eyetracker_attention_maps")
-    parser.add_argument("--gaze_map_size", default="auto", help="Gaze map size selection: 'auto' or integer (e.g. 14, 16).")
-    parser.add_argument("--gaze_subdir_fmt", default="{s}x{s}", help="Subfolder format under gaze_root (default: '14x14', '16x16', ...).")
+    #parser.add_argument("--gaze_map_size", default="auto", help="Gaze map size selection: 'auto' or integer (e.g. 14, 16).")
 
 
     # -------------------- MISC -------------------------------
@@ -314,25 +313,12 @@ def run_training_with_args(args, trial=None):
     Runs one full training session given a filled args Namespace.
     Returns best validation accuracy from train().
     """
-    # ----------------------------------------------------------------------------------------------
-    # Gaze mode normalization (new interface) + backward-compatible alias (legacy: args.gaze)
-    # ----------------------------------------------------------------------------------------------
-    gaze_mode = getattr(args, "gaze", None)
-    if gaze_mode is None:
-        gaze_mode = getattr(args, "gaze_mode", "off")
-    gaze_mode = str(gaze_mode).lower().strip()
-    if gaze_mode not in ("off", "align", "guide", "align+guide"):
-        gaze_mode = "off"
-
-    args.gaze_mode = gaze_mode
-    args.gaze = gaze_mode  # unified alias used across modules
-
 
     # ==============================================================================================
     # 0) ARG VALIDATION / NORMALIZATION
     # ==============================================================================================
     validate_and_normalize_args(args, strict=False, verbose=True)
-    args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=2e-5)
+    #args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=2e-5)
 
     print("=== Args ===")
     print(args, "\n")

@@ -38,6 +38,8 @@ parameters:
 
   dataset:
     value: images/printart/subjectivesafety_images/
+  gaze_root:
+    value: survey_eye_tracker/Eyetracker_attention_maps/864x508
   model_dir:
     value: models
   comparisons:
@@ -118,7 +120,7 @@ parameters:
   # G) Optimizer
   # ---------------------------------------------------------------------------
   base_lr:
-    value: 4e-4
+    value: 2e-5
   backbone_lr_scale:
     value: 1
   weight_decay:
@@ -195,13 +197,7 @@ parameters:
   # Gaze Configuration
   # ---------------------------------------------------------------------------
   gaze_mode:
-    values: ["guide", "off", "aligned", "align+guide"]
-    
-  gaze_map_size:
-    value: "auto"    # Options: "auto" or an integer (e.g., 14, 16)
-  
-  gaze_subdir_fmt:
-    value: "{s}x{s}" # Format for subfolders (e.g., "14x14")
+    values: ["guide", "off", "align", "align+guide"]
 
   attention_mode:
     values: ["last"]

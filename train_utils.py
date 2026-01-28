@@ -495,12 +495,23 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     gaze_grid = gaze_meta.get("grid_size", getattr(args, "gaze_grid_size", None))
     gaze_loss = gaze_meta.get("use_gaze_loss", None)
 
+    gaze_output = gaze_meta.get("gaze_output", eval_meta.get("gaze_output", "align"))
+    gaze_output = str(gaze_output).lower().strip()
+    if gaze_output not in ("align", "guide"):
+        gaze_output = "align"
+
+    out_size = gaze_meta.get("out_size", eval_meta.get("target_crop", None))
+
     if gaze_grid is not None:
-        print(f"  Gaze Enabled    : {_as_str(gaze_requested)} (grid={tuple(gaze_grid)})")
+        print(f"  Gaze Enabled    : {_as_str(gaze_requested)} (grid={tuple(gaze_grid)}, output={gaze_output})")
     else:
-        print(f"  Gaze Enabled    : {_as_str(gaze_requested)}")
+        print(f"  Gaze Enabled    : {_as_str(gaze_requested)} (output={gaze_output})")
+
+    if out_size is not None:
+        print(f"  Gaze Out Size   : {int(out_size)}x{int(out_size)} (guide output)")
     if gaze_loss is not None:
         print(f"  Gaze Loss       : {_as_str(gaze_loss)}")
+
 
     print("\n================ AUGMENTATION PLAN ================")
 
@@ -537,7 +548,13 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
             print(f"  - CenterCrop->{target_crop}")
             print("  - ToTensor -> Normalize")
             if gaze_requested:
-                print("  - Gaze: resize to match image geometry, center-crop, then downsample to grid")
+                go = str(getattr(pa, "gaze_output", gaze_meta.get("gaze_output", "align"))).lower().strip()
+                if go == "guide":
+                    print("    • gaze handling        : erased regions are zeroed in the out_size gaze map")
+                else:
+                    print("    • gaze handling        : erased regions are zeroed in the downsampled gaze grid")
+
+
         else:
             print("  - Resize(short side) -> CenterCrop -> ToTensor -> Normalize")
 
@@ -614,14 +631,24 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
         print(f"    • area fraction        : {es[0]:.2f}–{es[1]:.2f}")
         print(f"    • aspect ratio         : {er[0]:.2f}–{er[1]:.2f}")
         if gaze_requested:
-            print("    • gaze handling        : erased regions are zeroed in the downsampled gaze grid")
+            go = str(getattr(pa, "gaze_output", gaze_meta.get("gaze_output", "align"))).lower().strip()
+            if go == "guide":
+                print("    • gaze handling        : erased regions are zeroed in the out_size gaze map")
+            else:
+                print("    • gaze handling        : erased regions are zeroed in the downsampled gaze grid")
+
     else:
         print("  - Random erasing         : OFF")
 
     print("\n[Final deterministic steps]")
     print("  - ToTensor -> Normalize (backbone mean/std)")
     if gaze_requested:
-        print("  - Gaze: geometric ops mirror image; then downsample to grid")
+        go = str(getattr(pa, "gaze_output", gaze_meta.get("gaze_output", "align"))).lower().strip()
+        if go == "guide":
+            print("  - Gaze: geometric ops mirror image; keep at out_size (no final grid resize)")
+        else:
+            print("  - Gaze: geometric ops mirror image; then downsample to grid")
+
 
     print("==================================================\n")
 
@@ -792,8 +819,14 @@ def print_run_plan(
     if args.ties and args.ties_w > 0:
         parts.append(f"{args.ties_w:g}·ties")
 
-    if args.gaze != "off" and args.attn_w > 0:
+    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+    if gaze_mode not in ("off", "align", "guide", "align+guide"):
+        gaze_mode = "off"
+
+    use_gaze_kl = (gaze_mode in ("align", "align+guide"))
+    if use_gaze_kl and args.attn_w > 0:
         parts.append(f"{args.attn_w:g}·KL(gaze↔attn)")
+
 
     print("  objective   :", " + ".join(parts))
 

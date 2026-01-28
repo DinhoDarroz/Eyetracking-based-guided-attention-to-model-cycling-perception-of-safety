@@ -287,20 +287,57 @@ def compute_loss_classification(
 # Attention / gaze alignment (KL)
 # ====================================================================================== #
 
+def _to_bhw(x: Tensor) -> Tensor:
+    """
+    Convert x to shape [B, H, W].
+    Accepts [B,H,W] or [B,1,H,W] or [B,C,H,W] (C>1 -> channel-mean).
+    """
+    if x.dim() == 3:
+        return x
+    if x.dim() == 4:
+        if x.size(1) == 1:
+            return x[:, 0, :, :]
+        return x.mean(dim=1)
+    raise ValueError(f"Expected [B,H,W] or [B,C,H,W], got {tuple(x.shape)}")
+
+
+def _resize_bhw(x_bhw: Tensor, target_hw: tuple[int, int]) -> Tensor:
+    """
+    Resize [B,H,W] to target_hw using area for downsample, bilinear for upsample.
+    """
+    h0, w0 = int(x_bhw.shape[-2]), int(x_bhw.shape[-1])
+    h1, w1 = int(target_hw[0]), int(target_hw[1])
+
+    if (h0, w0) == (h1, w1):
+        return x_bhw
+
+    x4 = x_bhw.unsqueeze(1)  # [B,1,H,W]
+
+    downsample = (h1 < h0) or (w1 < w0)
+    if downsample:
+        y4 = F.interpolate(x4, size=(h1, w1), mode="area")
+    else:
+        y4 = F.interpolate(x4, size=(h1, w1), mode="bilinear", align_corners=False)
+
+    return y4.squeeze(1)  # [B,H,W]
+
+
 def normalize_to_prob(x: Tensor, eps: float = 1e-8) -> Tensor:
     """
     Normalize a non-negative map into a probability distribution per sample.
 
-    Input:  x [B, H, W] or [B, N]
-    Output: p [B, H*W] with sum(p_i) = 1 for each sample.
+    Input:  x [B,H,W] or [B,1,H,W] or [B,N]
+    Output: p [B,H*W] with sum(p_i)=1 per sample.
     """
     if x.dim() == 2:
         flat = x
     else:
-        flat = x.view(x.size(0), -1)
+        x_bhw = _to_bhw(x)
+        flat = x_bhw.view(x_bhw.size(0), -1)
 
     flat = flat.clamp(min=eps)
     return flat / flat.sum(dim=1, keepdim=True).clamp(min=eps)
+
 
 
 def attention_kl_loss(
@@ -315,19 +352,22 @@ def attention_kl_loss(
     Symmetric KL divergence between predicted attention maps and gaze maps.
 
     All maps are normalized to per-sample probability distributions before KL.
-
-    Args:
-        attn_left/attn_right: predicted attention maps [B,H,W] (not necessarily normalized)
-        gaze_left/gaze_right: gaze probability maps [B,H,W] 
-        has_mask: optional [B] indicating which samples have gaze data (1) vs missing (0)
-
-    Returns:
-        scalar KL loss
+    Gaze is resized to match attention map resolution when shapes differ.
     """
-    p_left = normalize_to_prob(gaze_left, eps=eps)
-    p_right = normalize_to_prob(gaze_right, eps=eps)
-    q_left = normalize_to_prob(attn_left, eps=eps)
-    q_right = normalize_to_prob(attn_right, eps=eps)
+    attn_left_bhw = _to_bhw(attn_left)
+    attn_right_bhw = _to_bhw(attn_right)
+
+    gaze_left_bhw = _to_bhw(gaze_left)
+    gaze_right_bhw = _to_bhw(gaze_right)
+
+    # Match gaze resolution to attention resolution (prevents shape mismatch in guide mode).
+    gaze_left_bhw = _resize_bhw(gaze_left_bhw, attn_left_bhw.shape[-2:])
+    gaze_right_bhw = _resize_bhw(gaze_right_bhw, attn_right_bhw.shape[-2:])
+
+    p_left = normalize_to_prob(gaze_left_bhw, eps=eps)
+    p_right = normalize_to_prob(gaze_right_bhw, eps=eps)
+    q_left = normalize_to_prob(attn_left_bhw, eps=eps)
+    q_right = normalize_to_prob(attn_right_bhw, eps=eps)
 
     kl_left = (p_left * (torch.log(p_left + eps) - torch.log(q_left + eps))).sum(dim=1)
     kl_right = (p_right * (torch.log(p_right + eps) - torch.log(q_right + eps))).sum(dim=1)

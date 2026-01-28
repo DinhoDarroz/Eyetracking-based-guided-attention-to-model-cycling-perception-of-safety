@@ -512,6 +512,31 @@ def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs:
     grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
     return int(grid_h), int(grid_w)
 
+import inspect
+
+# -------------------------------------------------------------------------------------------------
+# Gaze grid resolver
+# -------------------------------------------------------------------------------------------------
+
+def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs: dict) -> tuple[int, int]:
+    """
+    Resolve the supervision grid used by align-mode KL and (optionally) the data pipeline output.
+
+    If args.gaze_map_size != "auto", the grid is forced to (S, S).
+    Otherwise:
+      - CNN backbones use a fixed 14x14
+      - ViTs infer the patch grid from the backbone + specs
+    """
+    if str(getattr(args, "gaze_map_size", "auto")).lower() != "auto":
+        forced = int(getattr(args, "gaze_map_size"))
+        return forced, forced
+
+    if is_cnn_backbone:
+        return 14, 14
+
+    grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
+    return int(grid_h), int(grid_w)
+
 # -------------------------------------------------------------------------------------------------
 # Gaze flag resolver
 # -------------------------------------------------------------------------------------------------
@@ -542,12 +567,18 @@ def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool]:
 
 def _build_transforms_and_specs(args):
     """
-    Resolve backbone + preprocessing specs, and build train/eval transforms.
+    Resolve the backbone configuration and build preprocessing pipelines.
 
-    Key behavior:
-      - gaze tensors are always enabled in transforms so KL can always be computed for diagnostics
-      - KL contributes to training objective only in align modes when attn_w > 0
-      - guide injection is controlled later at model-forward time by gaze_mode
+    Responsibilities:
+      - Instantiate the requested backbone (CNN or transformer) and obtain its preprocessing specs.
+      - Resolve the gaze operating mode and the corresponding supervision grid size.
+      - Build evaluation transforms (deterministic resize + center-crop) and training transforms
+        (either identical to eval, or gaze-aware pairwise augmentation).
+
+    Gaze behavior:
+      - align: gaze follows image geometry and is finally resized to gaze_grid_size (KL supervision).
+      - guide: gaze follows image geometry and ends at out_size×out_size (model input resolution).
+      - align+guide: uses align-style output to keep KL well-defined on gaze_grid_size.
     """
     backbone_name = str(args.backbone).lower().strip()
     is_cnn_backbone = backbone_name in set(CNN_BACKBONES)
@@ -566,11 +597,18 @@ def _build_transforms_and_specs(args):
     else:
         backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
 
+    # Expected image crop resolution (square). Matches build_eval_transforms target_crop.
+    out_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
+
     # -----------------------------
-    # Gaze grid resolution
+    # Gaze grid resolution (supervision grid for align-mode KL)
     # -----------------------------
     grid_h, grid_w = _resolve_gaze_grid(args, is_cnn_backbone, backbone_model, model_specs)
     args.gaze_grid_size = (int(grid_h), int(grid_w))
+
+    # Default folder selector for dataset gaze loading:
+    # - align modes typically load gaze saved at the supervision grid size
+    # - guide mode typically loads gaze saved at out_size (crop resolution)
     args.gaze_map_size_int = int(grid_h)
 
     # -----------------------------
@@ -589,24 +627,41 @@ def _build_transforms_and_specs(args):
     )
 
     # -----------------------------
-    # Transforms (gaze always enabled)
+    # Transform gaze output policy
+    # -----------------------------
+    # build_eval_transforms expects "align" or "guide"
+    # - "guide" only when gaze_mode is exactly "guide"
+    # - "align" for "align", "align+guide", and "off"
+    gaze_output = "guide" if gaze_mode == "guide" else "align"
+
+    # Folder selector update for guide-only:
+    # dataset gaze loader should read maps stored at out_size (e.g., 224x224)
+    if gaze_output == "guide":
+        args.gaze_map_size_int = int(out_size)
+
+    # -----------------------------
+    # Eval transforms
     # -----------------------------
     eval_tfms, eval_meta = build_eval_transforms(
         model_specs,
         gaze_grid_size=args.gaze_grid_size,
         enable_gaze=True,
+        gaze_output=gaze_output,
     )
 
     augment_level = str(getattr(args, "augment", "none")).lower().strip()
     if augment_level not in ("none", "light", "heavy"):
         augment_level = "none"
 
+    # -----------------------------
+    # Train transforms
+    # -----------------------------
     if augment_level == "none":
         train_tfms = eval_tfms
         train_meta = {"train_policy": "deterministic (same as eval)", "augment": "none"}
     else:
         preset = AUG_PRESETS[augment_level]
-        train_tfms = Augmentation(
+        aug_kwargs = dict(
             augment=True,
             ties=bool(getattr(args, "ties", True)),
             resize_short=int(eval_meta["resize_dim"]),
@@ -616,19 +671,23 @@ def _build_transforms_and_specs(args):
             std=tuple(eval_meta["std"]),
             enable_gaze=True,
             gaze_grid_size=tuple(args.gaze_grid_size),
+            gaze_output=str(gaze_output),
             **preset,
         )
+
+        train_tfms = Augmentation(**aug_kwargs)
+
         train_meta = {
-            "train_policy": f"pairwise augmentation ({augment_level})",
-            "augment": augment_level,
-            "gaze_aware": True,
-            "params": dict(preset),
+            "train_policy": "deterministic (same as eval)",
+            "augment": "none",
+            "gaze_output": str(gaze_output),
         }
+
 
     # -----------------------------
     # Metadata
     # -----------------------------
-    args.expected_img_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
+    args.expected_img_size = int(out_size)
 
     args.transforms_meta = {
         "backbone": args.backbone,
@@ -636,11 +695,13 @@ def _build_transforms_and_specs(args):
         "model_specs": dict(model_specs),
         "gaze": {
             "mode": str(gaze_mode),
+            "gaze_output": str(gaze_output),
             "requested": True,
             "use_gaze_loss": bool(use_gaze_loss),
             "use_gaze_kl": bool(use_gaze_kl),
             "use_gaze_injection": bool(use_gaze_inj),
             "grid_size": tuple(args.gaze_grid_size),
+            "out_size": int(out_size),
             "attn_w": float(attn_w),
         },
         "eval": dict(eval_meta),
@@ -654,11 +715,11 @@ def _build_transforms_and_specs(args):
     return backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone
 
 
+
 def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tfms):
     
     #use_gaze = (str(getattr(args, "gaze_mode", "off")).lower().strip() != "off")
     use_gaze = True
-
 
     train_set = ComparisonsDataset(
         dataframe=X_train,
@@ -668,8 +729,6 @@ def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tf
         gaze_root=args.gaze_root,
         use_gaze=use_gaze,
         use_seg=args.use_seg,
-        map_size=args.gaze_map_size_int,
-        gaze_subdir_fmt=args.gaze_subdir_fmt,
     )
     val_set = ComparisonsDataset(
         dataframe=X_val,
@@ -679,8 +738,6 @@ def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tf
         gaze_root=args.gaze_root,
         use_gaze=use_gaze,
         use_seg=args.use_seg,
-        map_size=args.gaze_map_size_int,
-        gaze_subdir_fmt=args.gaze_subdir_fmt,
     )
     test_set = ComparisonsDataset(
         dataframe=X_test,
@@ -690,8 +747,6 @@ def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tf
         gaze_root=args.gaze_root,
         use_gaze=use_gaze,
         use_seg=args.use_seg,
-        map_size=args.gaze_map_size_int,
-        gaze_subdir_fmt=args.gaze_subdir_fmt,
     )
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)

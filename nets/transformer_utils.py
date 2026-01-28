@@ -505,7 +505,7 @@ class AttentionRecorder:
 
 
 # ================================================================================================
-# Gaze token embedding (C)
+# Gaze token embedding 
 # ================================================================================================
 
 class GazeTokenEmbedder(nn.Module):
@@ -542,7 +542,7 @@ class GazeTokenEmbedder(nn.Module):
 
 
 # ================================================================================================
-# GII injector (A) with per-layer parameters (B)
+# GII injector with per-layer parameters
 # ================================================================================================
 
 @dataclass(frozen=True)
