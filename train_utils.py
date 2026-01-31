@@ -270,13 +270,13 @@ BACKBONE_ALIAS_TO_TIMM_ID = {
     "vit_base_patch16_clip_224": "vit_base_patch16_clip_224.openai",
 
     # --- Modern High-Performance Alternates ---
-    "dinov2_base": "vit_base_patch14_dinov2.lvd142m",          # ✅ NEW (no registers)
+    "dinov2_base": "vit_base_patch14_dinov2.lvd142m",        
     "dinov2_reg_base": "vit_base_patch14_reg4_dinov2.lvd142m",
     "eva02_base": "eva02_base_patch14_448.mim_in22k_ft_in1k",
-    "convnext_base": "convnext_base.fb_in22k_ft_in1k",
+
 
     # --- Original / Canonical ViT ---
-    "vit_base_patch16_224": "vit_base_patch16_224.augreg_in21k_ft_in1k",  # ✅ NEW (original ViT-B/16)
+    "vit_base_patch16_224": "vit_base_patch16_224.augreg_in21k_ft_in1k",  
 
     # --- Legacy / Standard Transformers ---
     "vit_base_dino": "vit_base_patch16_224.dino",
@@ -287,21 +287,14 @@ BACKBONE_ALIAS_TO_TIMM_ID = {
     "deit_base_distilled": "deit_base_distilled_patch16_224.fb_in1k",
 
     # --- CNNs (Mapped for Preprocessing Specs) ---
-    # Note: train.py loads these via torchvision, but data.py needs these
-    # to fetch mean/std/crop info from timm.
     "alex": "alexnet",
     "vgg": "vgg19",
     "dense": "densenet121",
     "resnet": "resnet50",
-}
+    "convnext_base": "convnext_base.fb_in22k_ft_in1k",
+    "efficientnet_v2_s": "tf_efficientnetv2_s.in21k_ft_in1k",
+    "regnet_y_8gf": "regnety_080.ra3_in1k",
 
-
-DEFAULT_SPECS = {
-    "input_size": (3, 224, 224),
-    "crop_pct": 0.875,
-    "interpolation": "bilinear",
-    "mean": (0.485, 0.456, 0.406),
-    "std": (0.229, 0.224, 0.225),
 }
 
 def resolve_backbone(backbone_alias: str, *, pretrained: bool = True, strict: bool = True):
@@ -533,13 +526,15 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     print(f"Train Tfms Class  : {train_class}")
 
     is_aug = (train_tfms is not None and train_tfms.__class__.__name__ == "Augmentation")
-
-    # Deterministic path (train_tfms == eval_tfms), used when augment=none or gaze is enabled
+    
+    # --------------------------
+    # Deterministic path
+    # --------------------------
     if not is_aug:
         if augment_level != "none" and not gaze_requested:
             print("\n[WARNING]")
             print(f"  args.augment={augment_level} but training transform is not Augmentation (class={train_class}).")
-
+    
         print("\n[Deterministic preprocessing]")
         if eval_meta:
             resize_dim = eval_meta.get("resize_dim", "unknown")
@@ -547,27 +542,30 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
             print(f"  - Resize(short side)->{resize_dim} (aspect preserved)")
             print(f"  - CenterCrop->{target_crop}")
             print("  - ToTensor -> Normalize")
+    
             if gaze_requested:
-                go = str(getattr(pa, "gaze_output", gaze_meta.get("gaze_output", "align"))).lower().strip()
+                go = str(gaze_meta.get("gaze_output", eval_meta.get("gaze_output", "align"))).lower().strip()
                 if go == "guide":
-                    print("    • gaze handling        : erased regions are zeroed in the out_size gaze map")
+                    tc = eval_meta.get("target_crop", "unknown")
+                    print(f"  - Gaze: resize to match image geometry, center-crop, keep at {tc}x{tc}")
                 else:
-                    print("    • gaze handling        : erased regions are zeroed in the downsampled gaze grid")
-
-
+                    print("  - Gaze: resize to match image geometry, center-crop, then downsample to grid")
         else:
             print("  - Resize(short side) -> CenterCrop -> ToTensor -> Normalize")
-
+    
         print("==================================================\n")
         return
 
-    # Augmentation path (data.py: class Augmentation)
+
+    # --------------------------
+    # Augmentation path
+    # --------------------------
     pa = train_tfms
     ties_enabled = bool(getattr(args, "ties", True))
-
+    
     print(f"Data augmentation : ON ({augment_level})")
     print("Augmentation type : Pairwise ranking augmentation (L/R views)")
-
+    
     print("\n[Pairwise structure]")
     print(f"  - Swap left/right        : p={getattr(pa, 'swap_p', 0.0):g} (paired; label adjusted)")
     if ties_enabled:
@@ -575,18 +573,18 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
     else:
         print("    • ties disabled        : binary label inverted on swap")
     print(f"  - Horizontal flip        : p={getattr(pa, 'hflip_p', 0.0):g} ({_paired_label(getattr(pa, 'paired_hflip', True))})")
-
+    
     print("\n[Geometric preprocessing + crop]")
     print(f"  - Resize(short side)     : {getattr(pa, 'resize_short', 'unknown')} (always)")
     print(f"  - Ensure min side >=     : {getattr(pa, 'out_size', 'unknown')} (always)")
-
+    
     rot_deg = getattr(pa, "rot_deg", 0.0)
     rot_p = getattr(pa, "rot_p", 0.0)
     if rot_deg > 0.0 and rot_p > 0.0:
         print(f"  - Rotation               : p={rot_p:g}, ±{rot_deg:g}° ({_paired_label(getattr(pa, 'paired_rotation', True))})")
     else:
         print("  - Rotation               : OFF")
-
+    
     cs = getattr(pa, "crop_scale", None)
     cr = getattr(pa, "crop_ratio", None)
     if cs is not None and cr is not None:
@@ -598,20 +596,20 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
         print(f"    • resized to out_size  : {getattr(pa, 'out_size', 'unknown')} (always)")
     else:
         print("  - Crop                   : center crop to out_size (one crop per side)")
-
+    
     print("\n[Photometric augmentation]")
     cj = getattr(pa, "color_jitter", None)
     if cj is not None:
         print(f"  - Color jitter           : {cj} ({_paired_label(getattr(pa, 'paired_color_jitter', False))})")
     else:
         print("  - Color jitter           : OFF")
-
+    
     gray_p = getattr(pa, "gray_p", 0.0)
     if gray_p > 0.0:
         print(f"  - Grayscale              : p={gray_p:g} ({_paired_label(getattr(pa, 'paired_gray', False))})")
     else:
         print("  - Grayscale              : OFF")
-
+    
     blur_p = getattr(pa, "blur_p", 0.0)
     if blur_p > 0.0:
         print(
@@ -621,7 +619,7 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
         print("    • pairing note         : blur uses paired_color_jitter flag in the current implementation")
     else:
         print("  - Gaussian blur          : OFF")
-
+    
     print("\n[Tensor augmentation]")
     erase_p = getattr(pa, "erase_p", 0.0)
     if erase_p > 0.0:
@@ -630,16 +628,9 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
         print(f"  - Random erasing         : p={erase_p:g} ({_paired_label(getattr(pa, 'paired_erase', True))})")
         print(f"    • area fraction        : {es[0]:.2f}–{es[1]:.2f}")
         print(f"    • aspect ratio         : {er[0]:.2f}–{er[1]:.2f}")
-        if gaze_requested:
-            go = str(getattr(pa, "gaze_output", gaze_meta.get("gaze_output", "align"))).lower().strip()
-            if go == "guide":
-                print("    • gaze handling        : erased regions are zeroed in the out_size gaze map")
-            else:
-                print("    • gaze handling        : erased regions are zeroed in the downsampled gaze grid")
-
     else:
         print("  - Random erasing         : OFF")
-
+    
     print("\n[Final deterministic steps]")
     print("  - ToTensor -> Normalize (backbone mean/std)")
     if gaze_requested:
@@ -648,10 +639,8 @@ def print_transform_policy(args, train_tfms=None, eval_tfms=None) -> None:
             print("  - Gaze: geometric ops mirror image; keep at out_size (no final grid resize)")
         else:
             print("  - Gaze: geometric ops mirror image; then downsample to grid")
-
-
+    
     print("==================================================\n")
-
 
 # =================================================================================================
 # Run plan helpers

@@ -43,7 +43,7 @@ parameters:
   model_dir:
     value: models
   comparisons:
-    value: comparisons_df.pickle #comparisons_df_with_synthetic_berlin.pickle #comparisons_df.pickle
+    value: comparisons_df.pickle # comparisons_df.pickle #comparisons_df_with_synthetic_berlin.pickle #comparisons_df.pickle
   resume:
     value: false
   epoch:
@@ -63,7 +63,7 @@ parameters:
   model:
     value: rsscnn
   ties:
-    value: false
+    values: [false]
 
   # ---------------------------------------------------------------------------
   # D) Backbone & Architecture
@@ -71,15 +71,19 @@ parameters:
   backbone:
     values:
       #- "vit_small"
-      - "dinov3_vitb16"
+      #- "dinov3_vitb16"
       #- "deit3_base_patch16_224"
       #- "vit_base_patch16_224"
       #- "vit_base_patch16_clip_224"
+      #- "vgg"
+      #- "convnext_base"
+      - "efficientnet_v2_s"
+      - "regnet_y_8gf"
     
 
   pooling:
     values:
-      
+      #- patch_mean
       #- cls_max_concat
       #- mean
       - cls
@@ -98,7 +102,7 @@ parameters:
   # E) Fine-tuning policy
   # ---------------------------------------------------------------------------
   finetune:
-    value: true
+    value: false
     
   num_ft_blocks:
     values: [4]
@@ -145,13 +149,17 @@ parameters:
     value: 1
 
   ties_w:
-    value: 1.0
+    value: 10.0
   attn_w:
     value: 1
   label_smoothing:
     value: 0.0
   use_class_weights:
     value: false
+#  class_weights:
+#    value: "[1, 10, 1]"
+
+
 
   # ---------------------------------------------------------------------------
   # I) Scheduler
@@ -187,7 +195,7 @@ parameters:
   early_stop_mode:
     value: min
   early_stop_patience:
-    value: 4
+    value: 3
   early_stop_min_delta:
     value: 0.0
   early_stop_start_epoch:
@@ -197,7 +205,7 @@ parameters:
   # Gaze Configuration
   # ---------------------------------------------------------------------------
   gaze_mode:
-    values: ["guide", "off", "align", "align+guide"]
+    values: ["off"]
 
   attention_mode:
     values: ["last"]

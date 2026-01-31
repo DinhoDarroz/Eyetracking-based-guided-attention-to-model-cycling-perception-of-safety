@@ -69,7 +69,7 @@ def str2bool(v):
         return False
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
 
-
+        
 def arg_parse():
     parser = argparse.ArgumentParser(
         description="Training subjective safety",
@@ -95,6 +95,7 @@ def arg_parse():
         help="Augmentation level for training: none | light | heavy. (Applied only when gaze alignment is OFF.)",
     )
     parser.add_argument("--use_class_weights", nargs="?", const=True, default=False, type=str2bool)
+    parser.add_argument("--class_weights", type=float, nargs="+", default=None, help="Explicit class weight vector. Length must be 3 if --ties True, else 2. Overrides auto-computed weights when --use_class_weights True.",)
     parser.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool)
 
 
@@ -155,16 +156,18 @@ def arg_parse():
     # -------------------- GAZE & CITY FILTERS ----------------
     parser.add_argument(
         "--gaze_mode",
-        default="off",
-        choices=["off", "align", "guide", "align+guide"],
+        default="disable",
+        choices=["disable", "diag", "guide", "align", "align+gaze"],
         help=(
-            "Gaze behavior:\n"
-            "  off         : no gaze injection; KL is computed for diagnostics only\n"
-            "  align       : KL is computed and added to total loss (attn_w * KL)\n"
-            "  guide       : gaze injected; KL is computed for diagnostics only\n"
-            "  align+guide : gaze injected and KL is added to total loss (attn_w * KL)\n"
+            "disable     : completely disable gaze\n"
+            "diag        : KL diagnostic only\n"
+            "guide       : inject gaze, KL diagnostic only\n"
+            "align       : KL included in loss\n"
+            "align+gaze  : inject + KL in loss\n"
+            "Legacy: off→diag, align+guide→align+gaze\n"
         ),
     )
+    parser.add_argument("--eyetracker_filter", default="all", choices=["all","only"])
 
     parser.add_argument("--attention_mode", type=str, default="last", choices=["last", "rollout", "topk"],
     help=(
@@ -238,6 +241,11 @@ def arg_parse():
             "vgg",
             "dense",
             "resnet",
+
+            "convnext_base",
+            "efficientnet_v2_s",
+            "regnet_y_8gf",
+
         ],
         help="Model backbone to use. Default: dinov3_vitb16",
     )
@@ -356,7 +364,7 @@ def run_training_with_args(args, trial=None):
         train_pct=0.7,
         val_pct=0.1,
         test_pct=0.2,
-        load_if_exists=True,   # loads if files exist, otherwise splits
+        load_if_exists=False,   # loads if files exist, otherwise splits
     )
 
 

@@ -8,6 +8,15 @@ from sklearn.model_selection import train_test_split
 import logging
 from datetime import date
 
+import pickle
+
+import inspect
+import torchvision.transforms as transforms
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
+import torchvision.models as torch_models
+
+
 try:
     import wandb
 except Exception:
@@ -22,11 +31,21 @@ from train_utils import (
 
 from data import (
     ComparisonsDataset,
-    _get_interp_mode,
-    build_eval_transforms,
+    ResizeCenterCropAlignGaze,
     AUG_PRESETS,
     Augmentation,
 )
+
+@dataclass(frozen=True)
+class GazeConfig:
+    mode: str
+    load_gaze: bool
+    inject: bool
+    compute_kl: bool
+    use_kl_in_loss: bool
+    need_attn_maps: bool
+    gaze_output: str
+
 # -------------------------------------------------------------------------------------------------
 # Utilities
 # -------------------------------------------------------------------------------------------------
@@ -107,6 +126,8 @@ def initialize_wandb(args):
     wandb.define_metric("max_accuracy_train", step_metric="epoch")
     wandb.define_metric("max_accuracy_validation", step_metric="epoch")
     wandb.define_metric("max_accuracy_test", step_metric="epoch")
+    
+
 
 def read_data(args):
     # ------------------------------------------------------------------
@@ -419,18 +440,34 @@ def _print_label_distribution_by_split(X_train: pd.DataFrame, X_val: pd.DataFram
 
 
 def _compute_and_attach_class_weights(args, X_train: pd.DataFrame) -> None:
-    args.class_weights = compute_class_weights_from_df(
-        X_train["score_classification"],
-        use_ties=args.ties,
-        enable_weights=args.use_class_weights,
-    )
-
-    if args.use_class_weights and args.class_weights is not None:
-        cw = args.class_weights.detach().cpu().numpy().tolist()
-        print(f"Class weights: ON  (computed from Train split) → {cw}")
-    else:
+    if not args.use_class_weights:
+        args.class_weights = None
         print("Class weights: OFF")
+        print()
+        return
+
+    expected = 3 if bool(args.ties) else 2
+
+    if args.class_weights is not None:
+        w = [float(x) for x in args.class_weights]
+        if len(w) != expected:
+            raise ValueError(f"--class_weights must have length {expected} (got {len(w)}).")
+        if any(v < 0 for v in w):
+            raise ValueError("--class_weights entries must be >= 0.")
+        args.class_weights = w
+        print(f"Class weights: ON  (manual override) → {w}")
+        print()
+        return
+
+    cw = compute_class_weights_from_df(
+        X_train["score_classification"],
+        use_ties=bool(args.ties),
+        enable_weights=True,
+    )
+    args.class_weights = cw.detach().cpu().numpy().tolist()
+    print(f"Class weights: ON  (computed from Train split) → {args.class_weights}")
     print()
+
 
 
 def _parse_gpu_ids(args) -> list[int]:
@@ -490,29 +527,59 @@ TRANSFORMER_BACKBONES = [
     "deit_base_distilled",
 ]
 
-CNN_BACKBONES = ["alex", "vgg", "dense", "resnet"]
+CNN_BACKBONES = ["alex", "vgg", "dense", "resnet", "convnext_base", "efficientnet_v2_s", "regnet_y_8gf"]
 
-CNN_SPECS = {
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+CNN_SPECS_DEFAULT = {
     "input_size": (3, 224, 224),
     "crop_pct": 0.875,
-    "mean": (0.485, 0.456, 0.406),
-    "std": (0.229, 0.224, 0.225),
     "interpolation": "bilinear",
+    "mean": IMAGENET_MEAN,
+    "std": IMAGENET_STD,
+    "alias": "cnn_default",
+    "img_size": 224,
+}
+
+CNN_SPECS_BY_BACKBONE = {
+    "alex": CNN_SPECS_DEFAULT,
+    "vgg": CNN_SPECS_DEFAULT,
+    "dense": CNN_SPECS_DEFAULT,
+    "resnet": CNN_SPECS_DEFAULT,
+
+    "convnext_base": {
+        "input_size": (3, 224, 224),
+        "crop_pct": 224.0 / 232.0,
+        "interpolation": "bilinear",
+        "mean": IMAGENET_MEAN,
+        "std": IMAGENET_STD,
+        "alias": "convnext_base",
+        "img_size": 224,
+    },
+
+    "regnet_y_8gf": {
+        "input_size": (3, 224, 224),
+        "crop_pct": 224.0 / 232.0,
+        "interpolation": "bilinear",
+        "mean": IMAGENET_MEAN,
+        "std": IMAGENET_STD,
+        "alias": "regnet_y_8gf",
+        "img_size": 224,
+    },
+
+    "efficientnet_v2_s": {
+        "input_size": (3, 384, 384),
+        "crop_pct": 1.0,
+        "interpolation": "bilinear",
+        "mean": IMAGENET_MEAN,
+        "std": IMAGENET_STD,
+        "alias": "efficientnet_v2_s",
+        "img_size": 384,
+    },
 }
 
 
-def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs: dict) -> tuple[int, int]:
-    if str(getattr(args, "gaze_map_size", "auto")).lower() != "auto":
-        forced = int(getattr(args, "gaze_map_size"))
-        return forced, forced
-
-    if is_cnn_backbone:
-        return 14, 14
-
-    grid_h, grid_w = infer_vit_grid_size(backbone_model, model_specs)
-    return int(grid_h), int(grid_w)
-
-import inspect
 
 # -------------------------------------------------------------------------------------------------
 # Gaze grid resolver
@@ -541,30 +608,101 @@ def _resolve_gaze_grid(args, is_cnn_backbone: bool, backbone_model, model_specs:
 # Gaze flag resolver
 # -------------------------------------------------------------------------------------------------
 
-def _resolve_gaze_flags(args) -> tuple[str, bool, bool, bool]:
-    """
-    Normalize gaze mode and derive boolean flags.
+def _get_interp_mode(mode_str):
+    if mode_str is None:
+        raise ValueError("Interpolation mode is None; backbone config may be incomplete.")
 
-    Returns:
-      gaze_mode    : {"off","align","guide","align+guide"}
-      use_gaze_any : True if gaze tensors should be loaded/available (diagnostics or injection)
-      use_gaze_kl  : True if KL is part of the training objective (align modes)
-      use_gaze_inj : True if gaze is injected into transformer (guide modes)
-    """
-    gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
-    if gaze_mode not in ("off", "align", "guide", "align+guide"):
-        gaze_mode = "off"
+    mode_str = str(mode_str).lower()
+    mapping = {
+        "nearest": InterpolationMode.NEAREST,
+        "bilinear": InterpolationMode.BILINEAR,
+        "bicubic": InterpolationMode.BICUBIC,
+        "lanczos": InterpolationMode.LANCZOS,
+    }
 
-    use_gaze_any = True
-    use_gaze_kl = (gaze_mode in ("align", "align+guide"))
-    use_gaze_inj = (gaze_mode in ("guide", "align+guide"))
-    return gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj
+    if mode_str not in mapping:
+        raise ValueError(f"Unknown interpolation mode '{mode_str}'")
+
+    return mapping[mode_str]
+
 
 
 # -------------------------------------------------------------------------------------------------
 # Backbone specs + transforms
 # -------------------------------------------------------------------------------------------------
 
+def build_eval_transforms(
+    specs: dict,
+    gaze_grid_size=(14, 14),
+    enable_gaze: bool = True,
+    gaze_output: str = "align",  # "align" or "guide"
+):
+
+    """
+    Build deterministic validation/test preprocessing.
+
+    Steps:
+      - Resize by short side (preserve aspect ratio), then center-crop to the model input size
+      - If enabled and eyetracker data is present, apply the same geometric ops to gaze and downsample it
+      - Convert left/right images to tensors and normalize with backbone stats
+    """
+    target_crop = int(specs["input_size"][-1])
+    crop_pct = float(specs["crop_pct"])
+
+    # timm-style eval resize: input_size / crop_pct, clamped to >= input_size
+    resize_dim = max(target_crop, int(round(target_crop / crop_pct)))
+
+    img_interp = _get_interp_mode(specs["interpolation"])
+    mean = tuple(specs["mean"])
+    std = tuple(specs["std"])
+
+    def _to_tensor_and_normalize_pair(sample: dict) -> dict:
+        # Apply the same deterministic post-processing to both image views
+        for k in ("image_l", "image_r"):
+            if k in sample:
+                x = TF.to_tensor(sample[k])
+                sample[k] = TF.normalize(x, mean=mean, std=std)
+        return sample
+
+    eval_tfms = transforms.Compose(
+        [
+            ResizeCenterCropAlignGaze(
+                resize_dim=resize_dim,
+                target_crop=target_crop,
+                img_interp=img_interp,
+                gaze_grid_size=gaze_grid_size,
+                enable_gaze=bool(enable_gaze),
+                gaze_output=str(gaze_output),
+            ),
+            transforms.Lambda(_to_tensor_and_normalize_pair),
+        ]
+    )
+
+    gaze_output_norm = str(gaze_output).lower().strip()
+    
+    gaze_policy = "if enable_gaze: Resize(match,gaze)->CenterCrop(gaze)"
+    if gaze_output_norm == "align":
+        gaze_policy += "->ResizeDown(gaze)"
+    
+    meta = {
+        "target_crop": target_crop,
+        "resize_dim": resize_dim,
+        "crop_pct": crop_pct,
+        "interpolation": str(specs.get("interpolation", "bilinear")),
+        "mean": mean,
+        "std": std,
+        "gaze_grid_size": tuple(gaze_grid_size),
+        "enable_gaze": bool(enable_gaze),
+        "gaze_output": str(gaze_output),
+        "eval_policy": (
+            "Resize(short,img) -> CenterCrop(img); "
+            f"{gaze_policy}; "
+            "ToTensor/Norm(img)"
+        ),
+    }
+
+    return eval_tfms, meta
+    
 def _build_transforms_and_specs(args):
     """
     Resolve the backbone configuration and build preprocessing pipelines.
@@ -574,26 +712,35 @@ def _build_transforms_and_specs(args):
       - Resolve the gaze operating mode and the corresponding supervision grid size.
       - Build evaluation transforms (deterministic resize + center-crop) and training transforms
         (either identical to eval, or gaze-aware pairwise augmentation).
-
-    Gaze behavior:
-      - align: gaze follows image geometry and is finally resized to gaze_grid_size (KL supervision).
-      - guide: gaze follows image geometry and ends at out_size×out_size (model input resolution).
-      - align+guide: uses align-style output to keep KL well-defined on gaze_grid_size.
     """
     backbone_name = str(args.backbone).lower().strip()
     is_cnn_backbone = backbone_name in set(CNN_BACKBONES)
+
+    # -----------------------------
+    # Gaze flags (single source of truth)
+    # -----------------------------
+    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
+    args.gaze_mode = gaze_mode
+    args.gaze = gaze_mode
+
+    # build_eval_transforms expects "align" or "guide"
+    gaze_output = "guide" if gaze_mode == "guide" else "align"
+
+    attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
+
+    # KL affects gradients only in align modes and only if attn_w > 0
+    use_gaze_loss = (
+        str(getattr(args, "model", "")).lower().strip() == "rsscnn"
+        and bool(use_gaze_kl)
+        and attn_w > 0.0
+    )
 
     # -----------------------------
     # Backbone resolution
     # -----------------------------
     if is_cnn_backbone:
         backbone_model = None
-        model_specs = {
-            "alias": args.backbone,
-            "timm_id": None,
-            **CNN_SPECS,
-            "img_size": int(CNN_SPECS["input_size"][-1]),
-        }
+        model_specs = dict(CNN_SPECS_BY_BACKBONE.get(backbone_name, CNN_SPECS_DEFAULT))
     else:
         backbone_model, model_specs = resolve_backbone(args.backbone, pretrained=True, strict=True)
 
@@ -609,35 +756,7 @@ def _build_transforms_and_specs(args):
     # Default folder selector for dataset gaze loading:
     # - align modes typically load gaze saved at the supervision grid size
     # - guide mode typically loads gaze saved at out_size (crop resolution)
-    args.gaze_map_size_int = int(grid_h)
-
-    # -----------------------------
-    # Gaze flags (single source of truth)
-    # -----------------------------
-    gaze_mode, use_gaze_any, use_gaze_kl, use_gaze_inj = _resolve_gaze_flags(args)
-    args.gaze_mode = gaze_mode
-    args.gaze = gaze_mode
-
-    # KL affects gradients only in align modes and only if attn_w > 0
-    attn_w = float(getattr(args, "attn_w", 0.0) or 0.0)
-    use_gaze_loss = (
-        str(getattr(args, "model", "")).lower().strip() == "rsscnn"
-        and use_gaze_kl
-        and attn_w > 0.0
-    )
-
-    # -----------------------------
-    # Transform gaze output policy
-    # -----------------------------
-    # build_eval_transforms expects "align" or "guide"
-    # - "guide" only when gaze_mode is exactly "guide"
-    # - "align" for "align", "align+guide", and "off"
-    gaze_output = "guide" if gaze_mode == "guide" else "align"
-
-    # Folder selector update for guide-only:
-    # dataset gaze loader should read maps stored at out_size (e.g., 224x224)
-    if gaze_output == "guide":
-        args.gaze_map_size_int = int(out_size)
+    args.gaze_map_size_int = int(out_size) if gaze_output == "guide" else int(grid_h)
 
     # -----------------------------
     # Eval transforms
@@ -645,7 +764,7 @@ def _build_transforms_and_specs(args):
     eval_tfms, eval_meta = build_eval_transforms(
         model_specs,
         gaze_grid_size=args.gaze_grid_size,
-        enable_gaze=True,
+        enable_gaze=bool(use_gaze_any),
         gaze_output=gaze_output,
     )
 
@@ -669,20 +788,17 @@ def _build_transforms_and_specs(args):
             interpolation=_get_interp_mode(eval_meta["interpolation"]),
             mean=tuple(eval_meta["mean"]),
             std=tuple(eval_meta["std"]),
-            enable_gaze=True,
+            enable_gaze=bool(use_gaze_any),
             gaze_grid_size=tuple(args.gaze_grid_size),
             gaze_output=str(gaze_output),
             **preset,
         )
-
         train_tfms = Augmentation(**aug_kwargs)
-
         train_meta = {
-            "train_policy": "deterministic (same as eval)",
-            "augment": "none",
+            "train_policy": f"augmentation ({augment_level})",
+            "augment": str(augment_level),
             "gaze_output": str(gaze_output),
         }
-
 
     # -----------------------------
     # Metadata
@@ -696,7 +812,7 @@ def _build_transforms_and_specs(args):
         "gaze": {
             "mode": str(gaze_mode),
             "gaze_output": str(gaze_output),
-            "requested": True,
+            "requested": bool(use_gaze_any),
             "use_gaze_loss": bool(use_gaze_loss),
             "use_gaze_kl": bool(use_gaze_kl),
             "use_gaze_injection": bool(use_gaze_inj),
@@ -710,10 +826,8 @@ def _build_transforms_and_specs(args):
         "eval_transform_class": eval_tfms.__class__.__name__,
     }
 
-    # Gaze tensors are always expected by the dataset/loader in this simplified design
-    use_gaze_requested = True
+    use_gaze_requested = bool(use_gaze_any)
     return backbone_model, model_specs, train_tfms, eval_tfms, use_gaze_requested, use_gaze_loss, is_cnn_backbone
-
 
 
 def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tfms):
@@ -752,6 +866,7 @@ def _build_dataloaders(args, logger, X_train, X_val, X_test, train_tfms, eval_tf
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
     test_loader = DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+    
     return train_loader, val_loader, test_loader
 
 
@@ -772,10 +887,14 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         from torchvision import models
 
         cnn_factory = {
-            "alex": models.alexnet,
-            "vgg": models.vgg19,
-            "dense": models.densenet121,
-            "resnet": models.resnet50,
+            "alex": torch_models.alexnet,
+            "vgg": torch_models.vgg19_bn,
+            "dense": torch_models.densenet121,
+            "resnet": torch_models.resnet50,
+        
+            "convnext_base": torch_models.convnext_base,
+            "efficientnet_v2_s": torch_models.efficientnet_v2_s,
+            "regnet_y_8gf": torch_models.regnet_y_8gf,
         }
 
         flatten_spatial = (str(getattr(args, "cnn_pool", "gap")).lower().strip() == "flatten")

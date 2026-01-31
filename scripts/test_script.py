@@ -66,8 +66,10 @@ def test(device, net, dataloader, args, logger=None):
 
             if gaze_l is None or gaze_r is None or has_eye is None:
                 # Legacy datasets: create dummy tensors
-                gaze_l = torch.zeros((label_r.size(0), 14, 14), device=device)
-                gaze_r = torch.zeros((label_r.size(0), 14, 14), device=device)
+                ms = int(getattr(args, "gaze_map_size_int", 14))
+                gaze_l = torch.zeros((label_r.size(0), ms, ms), device=device)
+                gaze_r = torch.zeros((label_r.size(0), ms, ms), device=device)
+
                 has_eye_mask = torch.zeros((label_r.size(0),), dtype=torch.bool, device=device)
             else:
                 gaze_l = gaze_l.to(device)
@@ -91,7 +93,23 @@ def test(device, net, dataloader, args, logger=None):
             # ----------------------------
             # 2) Forward + loss
             # ----------------------------
-            forward_dict = net(input_left, input_right)
+            # Resolve gaze mode and whether injection is active
+            gaze_mode = str(getattr(args, "gaze_mode", getattr(args, "gaze", "off"))).lower().strip()
+            if gaze_mode not in ("off", "align", "guide", "align+guide"):
+                gaze_mode = "off"
+            
+            use_gaze_inj = (gaze_mode in ("guide", "align+guide"))
+            
+            # Detect transformer wrapper (DataParallel-safe)
+            net_cfg = net.module if isinstance(net, torch.nn.DataParallel) else net
+            is_transformer = hasattr(net_cfg, "transformer")
+            
+            # Guided forward only for transformer models
+            if use_gaze_inj and is_transformer:
+                forward_dict = net(input_left, input_right, gaze_l, gaze_r, has_eye_mask)
+            else:
+                forward_dict = net(input_left, input_right)
+
 
             # compute_loss returns total loss + optional parts (class / rank / KL) when return_parts=True
             loss_t, parts = compute_loss(args, forward_dict, labels, return_parts=True)
