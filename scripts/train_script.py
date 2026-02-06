@@ -28,7 +28,7 @@ from torch import nn
 
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint
-from ignite.metrics import RunningAverage, Average, Accuracy
+from ignite.metrics import Metric, RunningAverage, Average, Accuracy
 
 
 from utils.accuracy import RankAccuracy, RankAccuracy_withMargin
@@ -77,6 +77,30 @@ class EarlyStopper:
         self.bad_epochs += 1
         should_stop = self.bad_epochs >= self.patience
         return should_stop, improved
+
+
+class WeightedAverage(Metric):
+    """Compute a weighted average over engine outputs."""
+
+    def __init__(self, value_fn, weight_fn, device=None):
+        super().__init__(output_transform=lambda x: x, device=device)
+        self.value_fn = value_fn
+        self.weight_fn = weight_fn
+
+    def reset(self) -> None:
+        self._sum = torch.tensor(0.0, device=self._device)
+        self._weight = torch.tensor(0.0, device=self._device)
+
+    def update(self, output) -> None:
+        value = torch.as_tensor(self.value_fn(output), device=self._device, dtype=torch.float32)
+        weight = torch.as_tensor(self.weight_fn(output), device=self._device, dtype=torch.float32)
+        self._sum += value * weight
+        self._weight += weight
+
+    def compute(self):
+        if self._weight.item() == 0:
+            return 0.0
+        return (self._sum / self._weight).item()
 
 class BackboneFreezeController:
     """
@@ -801,8 +825,16 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
 
             # 2) Gaze/KL diagnostics (always attach; KL is always computed in compute_loss)
             #    In guide/off modes, loss_kl_weighted stays 0 because w_kl_eff=0.
-            RunningAverage(output_transform=lambda x: x.get("loss_kl", 0.0), device=device).attach(engine, "loss_kl")
-            RunningAverage(output_transform=lambda x: x.get("loss_kl_weighted", 0.0), device=device).attach(engine, "loss_kl_weighted")
+            WeightedAverage(
+                value_fn=lambda x: x.get("loss_kl", 0.0),
+                weight_fn=lambda x: x.get("gaze_count", 0),
+                device=device,
+            ).attach(engine, "loss_kl")
+            WeightedAverage(
+                value_fn=lambda x: x.get("loss_kl_weighted", 0.0),
+                weight_fn=lambda x: x.get("gaze_count", 0),
+                device=device,
+            ).attach(engine, "loss_kl_weighted")
             RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
 
             # Optional but strongly recommended: confirms whether any gaze samples exist in batches

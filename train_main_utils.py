@@ -746,6 +746,7 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         return net
 
     from nets.transformer import Transformer as Net
+    from nets.transformer_utils import GuideGuidanceConfig
 
     net = Net(
         backbone=backbone_model,
@@ -763,6 +764,10 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         attn_topk=args.attn_topk,
         attn_out_hw=tuple(getattr(args, "gaze_grid_size", (14, 14))),
         use_gaze_injection=bool(use_gaze_inj),
+        guidance_cfg=GuideGuidanceConfig(
+            enabled=bool(use_gaze_inj),
+            drop_prob=0.0,
+        ),
     )
 
     net.attn_grad = bool(getattr(gaze_cfg, "use_kl_in_loss", False))
