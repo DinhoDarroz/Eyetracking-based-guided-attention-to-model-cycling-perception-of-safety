@@ -253,6 +253,8 @@ def _build_metrics_output(
             {
                 "logits": forward_dict["logits"]["output"],
                 "label": labels["label_c"].long(),
+                "y_pred": forward_dict["logits"]["output"],
+                "y": labels["label_c"].long(),
             }
         )
         return out
@@ -265,6 +267,8 @@ def _build_metrics_output(
                 "logits": forward_dict["logits"]["output"],
                 "label_r": labels["label_r"],
                 "label_c": labels["label_c"],
+                "y_pred": forward_dict["logits"]["output"],
+                "y": labels["label_c"],
             }
         )
 
@@ -835,7 +839,11 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
                 weight_fn=lambda x: x.get("gaze_count", 0),
                 device=device,
             ).attach(engine, "loss_kl_weighted")
+<<<<<<< codex/remove-amp-capability-from-codebase-06uyha
+            RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
+=======
             #RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
+>>>>>>> main
 
             # Optional but strongly recommended: confirms whether any gaze samples exist in batches
             #RunningAverage(output_transform=lambda x: float(x.get("gaze_count", 0)), device=device).attach(engine, "gaze_count")
