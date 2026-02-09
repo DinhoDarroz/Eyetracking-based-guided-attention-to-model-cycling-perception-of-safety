@@ -750,13 +750,13 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
 
     guidance_cfg = GuideGuidanceConfig(
         enabled=bool(use_gaze_inj),
-        bottleneck_dim=int(getattr(args, "guidance_bottleneck_dim", 128)),
-        gaze_hidden_dim=int(getattr(args, "guidance_gaze_hidden_dim", 64)),
-        conv_hidden_channels=int(getattr(args, "guidance_conv_hidden_channels", 64)),
-        drop_prob=float(getattr(args, "guidance_drop_prob", 0.0)),
-        strength=float(getattr(args, "guidance_strength", 1.0)),
+        bottleneck_dim=128,
+        gaze_hidden_dim=64,
+        conv_hidden_channels=64,
+        drop_prob=0.0,
+        strength=4,
     )
-
+    
     net = Net(
         backbone=backbone_model,
         model=args.model,

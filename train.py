@@ -377,7 +377,7 @@ def run_training_with_args(args, trial=None):
         val_pct=0.1,
         test_pct=0.2,
         load_if_exists=False,   # loads if files exist, otherwise splits
-        save_splits=True
+        save_splits=False,
     )
 
 

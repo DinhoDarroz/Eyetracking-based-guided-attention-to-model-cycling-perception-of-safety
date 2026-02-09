@@ -559,7 +559,7 @@ class GuideGuidanceConfig:
     gaze_hidden_dim: int = 30
     conv_hidden_channels: int = 64
     drop_prob: float = 0
-    strength: float = 1.0
+    strength: float = 10.0
 
 
 class GIIInjectorLayer(nn.Module):

@@ -29,6 +29,7 @@ from torch import nn
 from ignite.engine import Engine, Events
 from ignite.handlers import ModelCheckpoint
 from ignite.metrics import Metric, RunningAverage, Average, Accuracy
+from collections.abc import Mapping
 
 
 from utils.accuracy import RankAccuracy, RankAccuracy_withMargin
@@ -82,25 +83,87 @@ class EarlyStopper:
 class WeightedAverage(Metric):
     """Compute a weighted average over engine outputs."""
 
-    def __init__(self, value_fn, weight_fn, device=None):
+    def __init__(self, value_fn, weight_fn, device=None, strict: bool = True, debug_first_n: int = 0):
         super().__init__(output_transform=lambda x: x, device=device)
         self.value_fn = value_fn
         self.weight_fn = weight_fn
+        self.strict = bool(strict)
+        self._dbg_left = int(max(0, debug_first_n))
 
     def reset(self) -> None:
         self._sum = torch.tensor(0.0, device=self._device)
         self._weight = torch.tensor(0.0, device=self._device)
 
+    @staticmethod
+    def _extract_mapping(obj):
+        if isinstance(obj, Mapping):
+            return obj
+        if isinstance(obj, (tuple, list)):
+            for v in obj:
+                m = WeightedAverage._extract_mapping(v)
+                if m is not None:
+                    return m
+        return None
+
+    @staticmethod
+    def _to_scalar(x, device):
+        t = torch.as_tensor(x, device=device, dtype=torch.float32).reshape(-1)
+        if t.numel() != 1:
+            raise TypeError(f"Expected scalar, got shape {tuple(t.shape)}")
+        return t[0]
+
+    def iteration_completed(self, engine) -> None:
+        output = engine.state.output
+
+        if self._dbg_left > 0:
+            self._dbg_left -= 1
+            print("[DEBUG WeightedAverage] engine.state.output type:", type(output).__name__)
+            if isinstance(output, Mapping):
+                print("[DEBUG WeightedAverage] keys:", list(output.keys())[:30])
+            elif isinstance(output, (tuple, list)):
+                print("[DEBUG WeightedAverage] tuple/list len:", len(output))
+                print("[DEBUG WeightedAverage] elem types:", [type(x).__name__ for x in output[:10]])
+
+        self.update(output)
+
     def update(self, output) -> None:
-        value = torch.as_tensor(self.value_fn(output), device=self._device, dtype=torch.float32)
-        weight = torch.as_tensor(self.weight_fn(output), device=self._device, dtype=torch.float32)
+        out = self._extract_mapping(output)
+
+        if out is None:
+            if self.strict:
+                raise TypeError(
+                    f"WeightedAverage expected engine output containing a Mapping, got {type(output).__name__}."
+                )
+            return
+
+        value = self._to_scalar(self.value_fn(out), self._device)
+        weight = self._to_scalar(self.weight_fn(out), self._device)
+
+        if weight.item() <= 0.0:
+            return
+
         self._sum += value * weight
         self._weight += weight
 
     def compute(self):
-        if self._weight.item() == 0:
+        if self._weight.item() <= 0.0:
             return 0.0
         return (self._sum / self._weight).item()
+        
+class SumMetric(Metric):
+    """Accumulate a sum over engine outputs."""
+
+    def __init__(self, output_transform=lambda x: x, device=None):
+        super().__init__(output_transform=output_transform, device=device)
+
+    def reset(self) -> None:
+        self._sum = torch.tensor(0.0, device=self._device)
+
+    def update(self, output) -> None:
+        self._sum += torch.as_tensor(output, device=self._device, dtype=torch.float32)
+
+    def compute(self):
+        return float(self._sum.item())
 
 class BackboneFreezeController:
     """
@@ -680,19 +743,8 @@ def _make_train_step(
         inputs, labels = _prepare_batch(data, device, args)
 
         forward_dict = net(*inputs)
+        
         loss_total, parts = compute_loss(args, forward_dict, labels, return_parts=True)
-
-        if not torch.isfinite(loss_total.detach()).item():
-            label_r = labels["label_r"]
-            n_ties = (label_r == 0).sum().item()
-            n_nonties = (label_r != 0).sum().item()
-            print(
-                f"[NaN/Inf DETECTED] epoch={engine.state.epoch} "
-                f"iter={engine.state.iteration} "
-                f"batch_size={label_r.size(0)}, "
-                f"n_nonties={n_nonties}, n_ties={n_ties}"
-            )
-            raise ValueError("Non-finite loss detected; stopping for debugging.")
 
         loss_scaled = loss_total / accum
 
@@ -719,6 +771,7 @@ def _make_train_step(
             loss=loss_total.detach(),
             parts=parts,
         )
+
         return out
 
     return train_step
@@ -833,20 +886,23 @@ def _attach_metrics(engines: List[Engine], args, device: torch.device) -> None:
                 value_fn=lambda x: x.get("loss_kl", 0.0),
                 weight_fn=lambda x: x.get("gaze_count", 0),
                 device=device,
+                strict=True,
+                debug_first_n=0,
             ).attach(engine, "loss_kl")
+            
             WeightedAverage(
                 value_fn=lambda x: x.get("loss_kl_weighted", 0.0),
                 weight_fn=lambda x: x.get("gaze_count", 0),
                 device=device,
+                strict=True,
+                debug_first_n=0,
             ).attach(engine, "loss_kl_weighted")
-<<<<<<< codex/remove-amp-capability-from-codebase-06uyha
-            RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
-=======
+
             #RunningAverage(output_transform=lambda x: x.get("w_kl_eff", 0.0), device=device).attach(engine, "w_kl_eff")
->>>>>>> main
 
             # Optional but strongly recommended: confirms whether any gaze samples exist in batches
-            #RunningAverage(output_transform=lambda x: float(x.get("gaze_count", 0)), device=device).attach(engine, "gaze_count")
+            SumMetric(output_transform=lambda x: float(x.get("gaze_count", 0)), device=device).attach(engine, "gaze_count")
+
 
             # Optional: track which mode is active in logs (string; keep in output dict but not as metric)
             # gaze_mode, *_ = _resolve_gaze_flags(args)
@@ -1144,6 +1200,10 @@ def _make_validation_handler(
                     "loss_kl_train": engine.state.metrics.get("loss_kl") or 0.0,
                     "loss_kl_validation": evaluator.state.metrics.get("loss_kl") or 0.0,
                     "loss_kl_test": evaluator_test.state.metrics.get("loss_kl") or 0.0,
+                    
+                    #"gaze_count_train": engine.state.metrics.get("gaze_count") or 0.0,
+                    #"gaze_count_validation": evaluator.state.metrics.get("gaze_count") or 0.0,
+                    #"gaze_count_test": evaluator_test.state.metrics.get("gaze_count") or 0.0,
         
                     "c_accuracy_train": engine.state.metrics.get("c_acc"),
                     "c_accuracy_validation": evaluator.state.metrics.get("c_acc"),
@@ -1451,7 +1511,7 @@ def train(
     # Run training loop
     # ------------------------------------------------------------------------------------------------
     trainer.run(train_loader, max_epochs=args.max_epochs)
-    
+        
     """
     # ------------------------------------------------------------------------------------------------
     # Final evaluation using best-validation weights (not last epoch)
