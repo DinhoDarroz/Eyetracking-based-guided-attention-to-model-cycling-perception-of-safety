@@ -96,14 +96,6 @@ def arg_parse():
     parser.add_argument("--use_class_weights", nargs="?", const=True, default=False, type=str2bool)
     parser.add_argument("--use_seg", nargs="?", const=True, default=False, type=str2bool)
 
-    # -------------------- GAZE GUIDANCE (Guide mode) --------------------
-    parser.add_argument("--guidance_drop_prob", type=float, default=0.0, help="Stochastic gaze disable prob (guide mode).")
-    parser.add_argument("--guidance_strength", type=float, default=1.0, help="Scale applied to injected guidance residual.")
-    parser.add_argument("--guidance_bottleneck_dim", type=int, default=128, help="GII bottleneck dim (d').")
-    parser.add_argument("--guidance_gaze_hidden_dim", type=int, default=64, help="Gaze token embedding dim (dg).")
-    parser.add_argument("--guidance_conv_hidden_channels", type=int, default=64, help="GFF conv hidden channels.")
-
-
     # -------------------- SCHEDULER -------------------------
     parser.add_argument(
         "--scheduler",
@@ -205,40 +197,19 @@ def arg_parse():
 
     # -------------------- EG-ViT (GAZE MASKING) ----------------
     egvit_group = parser.add_argument_group("EG-ViT gaze masking options")
-    egvit_group.add_argument(
-        "--egvit_mask_type",
-        type=str,
-        default="focused",
-        choices=["separated", "focused"],
-        help="Mask construction strategy for --gaze_mode=egvit.",
+    egvit_group.add_argument("--egvit_mask_type",type=str,default="separated",choices=["separated", "focused"],help="Mask construction strategy for --gaze_mode=egvit.",)
+    egvit_group.add_argument("--egvit_keep_ratio",type=float,default=0.25,help="Fraction of patch tokens to keep for separated masks (e.g., 0.25 keeps top 25% patches).",)
+    egvit_group.add_argument("--egvit_focus_hw",type=int,nargs=2,default=(7, 7),help="Focused mask window size in patch units: H W (used only when --egvit_mask_type=focused).",)
+    egvit_group.add_argument("--egvit_drop_prob",type=float,default=0.0,help="Probability to disable EG-ViT masking per-sample during training (stochastic robustness).",)
+    egvit_group.add_argument("--egvit_train_only",nargs="?",const=True,default=True,type=str2bool,help="If True, apply EG-ViT masking only during training; eval() becomes a vanilla ViT forward.",
     )
-    egvit_group.add_argument(
-        "--egvit_keep_ratio",
-        type=float,
-        default=0.25,
-        help="Fraction of patch tokens to keep for separated masks (e.g., 0.25 keeps top 25% patches).",
-    )
-    egvit_group.add_argument(
-        "--egvit_focus_hw",
-        type=int,
-        nargs=2,
-        default=(7, 7),
-        help="Focused mask window size in patch units: H W (used only when --egvit_mask_type=focused).",
-    )
-    egvit_group.add_argument(
-        "--egvit_drop_prob",
-        type=float,
-        default=0.0,
-        help="Probability to disable EG-ViT masking per-sample during training (stochastic robustness).",
-    )
-    egvit_group.add_argument(
-        "--egvit_train_only",
-        nargs="?",
-        const=True,
-        default=True,
-        type=str2bool,
-        help="If True, apply EG-ViT masking only during training; eval() becomes a vanilla ViT forward.",
-    )
+    # -------------------- GAZE GUIDANCE (Guide mode) --------------------
+    parser.add_argument("--guidance_drop_prob", type=float, default=0.0, help="Stochastic gaze disable prob (guide mode).")
+    parser.add_argument("--guidance_strength", type=float, default=2.5, help="Scale applied to injected guidance residual.")
+    parser.add_argument("--guidance_bottleneck_dim", type=int, default=20, help="GII bottleneck dim (d').")
+    parser.add_argument("--guidance_gaze_hidden_dim", type=int, default=30, help="Gaze token embedding dim (dg).")
+    parser.add_argument("--guidance_conv_hidden_channels", type=int, default=64, help="GFF conv hidden channels.")
+    parser.add_argument("--guide_train_only",nargs="?",const=True,default=False,type=str2bool,help="When True, disables Guide/GII gaze injection during eval() (validation/test).",)
 
 
     # -------------------- LR & OPTIMIZATION ------------------
@@ -342,7 +313,7 @@ def arg_parse():
     parser.add_argument("--label_smoothing", type=float, default=0)
     parser.add_argument("--attn_w", type=float, default=1.0)
     parser.add_argument("--gaze_root", type=str, default="Eyetracker_attention_maps")
-    #parser.add_argument("--gaze_map_size", default="auto", help="Gaze map size selection: 'auto' or integer (e.g. 14, 16).")
+    parser.add_argument("--gaze_map_size", default="auto", help="Gaze map size selection: 'auto' or integer (e.g. 14, 16).")
 
 
     # -------------------- MISC -------------------------------

@@ -336,9 +336,6 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
 
     return ArgsCheckReport(warnings=warnings, errors=errors)
     
-# =============================================================================================== #
-# Backbone factory
-# =============================================================================================== #
 
 # ========================================================================= #
 # CONFIGURATION & PRESETS for Transformations
@@ -400,18 +397,19 @@ DEFAULT_SPECS = {
     "std": (0.229, 0.224, 0.225),
 }
 
-def resolve_backbone(backbone_alias: str, *, pretrained: bool = True, strict: bool = True):
+def resolve_backbone(
+    backbone_alias: str,
+    *,
+    pretrained: bool = True,
+    strict: bool = True,
+):
     """
-    Single source of truth:
-      - alias -> timm_id
-      - timm_id -> pretrained preprocessing specs
-      - (optionally) instantiate model with native img_size
-    Returns:
-      model, specs
+    Resolves timm id + preprocessing specs.
+    If the resolved pretrained size is > 300, forces DEFAULT_SPECS (224 pipeline).
+    Returns: model, specs
     """
     timm_id = BACKBONE_ALIAS_TO_TIMM_ID.get(backbone_alias, backbone_alias)
 
-    # 1) Resolve pretrained preprocessing config without downloading weights
     try:
         dummy = timm.create_model(timm_id, pretrained=False)
         cfg = timm.data.resolve_data_config({}, model=dummy)
@@ -431,59 +429,66 @@ def resolve_backbone(backbone_alias: str, *, pretrained: bool = True, strict: bo
     }
     specs["img_size"] = int(specs["input_size"][-1])
 
-    # 2) Build the actual model consistent with specs
-    img_size = specs["img_size"]
-    
-    # --- FIX START: Force vanilla attention ---
+    if specs["img_size"] > 300:
+        specs["input_size"] = DEFAULT_SPECS["input_size"]
+        specs["crop_pct"] = DEFAULT_SPECS["crop_pct"]
+        specs["interpolation"] = DEFAULT_SPECS["interpolation"]
+        specs["mean"] = DEFAULT_SPECS["mean"]
+        specs["std"] = DEFAULT_SPECS["std"]
+        specs["img_size"] = int(DEFAULT_SPECS["input_size"][-1])
+
     kwargs = dict(
-        pretrained=pretrained, 
-        num_classes=0, 
-        img_size=img_size,
-        exportable=True,  # <--- CRITICAL: Forces vanilla attention layers (hook-friendly)
+        pretrained=pretrained,
+        num_classes=0,
+        img_size=int(specs["img_size"]),
+        exportable=True,
     )
-    # --- FIX END ---
 
     try:
         model = timm.create_model(timm_id, **kwargs)
     except TypeError:
-        # If model doesn't accept specific kwargs (like img_size or exportable), drop them safely
-        # Note: most modern timm models support exportable=True, but we handle the edge case.
         kwargs.pop("img_size", None)
         try:
             model = timm.create_model(timm_id, **kwargs)
         except TypeError:
-            # Fallback: remove exportable if that was the issue (unlikely but safe)
             kwargs.pop("exportable", None)
             model = timm.create_model(timm_id, **kwargs)
 
     return model, specs
-
+    
 def infer_vit_grid_size(backbone_model, model_specs: dict) -> tuple[int, int]:
-    # Prefer explicit in specs if present
+    """
+    Infers the ViT patch-token grid size (H, W) from a timm-style ViT/DeiT backbone.
+
+    Uses:
+      - img_size from model_specs (fallback: input_size[-1])
+      - patch_size from backbone_model.patch_embed.patch_size or backbone_model.patch_size
+
+    Returns:
+      (grid_h, grid_w) where grid_h = grid_w = img_size // patch_size
+    """
     img_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
 
     patch = None
 
-    # timm ViT / DeiT: patch_embed.patch_size exists
     pe = getattr(backbone_model, "patch_embed", None)
     if pe is not None and hasattr(pe, "patch_size"):
         p = pe.patch_size
         patch = int(p[0] if isinstance(p, (tuple, list)) else p)
 
-    # Some models expose patch_size directly
     if patch is None and hasattr(backbone_model, "patch_size"):
         p = backbone_model.patch_size
         patch = int(p[0] if isinstance(p, (tuple, list)) else p)
 
     if patch is None:
-        raise RuntimeError("Could not infer patch size from backbone; add patch_size to resolve_backbone specs.")
+        raise RuntimeError("Patch size not found on backbone; add patch_size to specs during resolve_backbone.")
 
     if img_size % patch != 0:
-        # Still compute, but warn-worthy: token grids could be non-integer if resize/crop differs.
-        raise RuntimeError(f"img_size ({img_size}) not divisible by patch_size ({patch}).")
+        raise RuntimeError(f"img_size={img_size} not divisible by patch_size={patch}.")
 
     g = img_size // patch
     return (g, g)
+
 
 # =================================================================================================
 # Class weights
@@ -1037,32 +1042,3 @@ def print_run_plan(
 
     print("=" * 100 + "\n")
 
-def resolve_batch_size(args):
-    """
-    Resolve batch size based on finetuning configuration.
-
-    Policy:
-      - finetune = False        -> batch_size = 128
-      - finetune = True:
-          num_ft_blocks = 1     -> batch_size = 128
-          num_ft_blocks = 4     -> batch_size = 64
-          num_ft_blocks >= 8    -> batch_size = 32
-
-    Explicit --batch_size always overrides this logic.
-    """
-
-    # Explicit override always wins
-    if args.batch_size is not None:
-        return args.batch_size
-
-    # No finetuning → large batch
-    if not args.finetune:
-        return 128
-
-    # Finetuning cases
-    if args.num_ft_blocks <= 1:
-        return 128
-    elif args.num_ft_blocks <= 4:
-        return 64
-    else:
-        return 32

@@ -722,18 +722,20 @@ def _apply_egvit_last_layer_merge(
 @dataclass(frozen=True)
 class GuideGuidanceConfig:
     """
-    bottleneck_dim: d' in the paper (optimal = 20 for ViT-B/16)
-    gaze_hidden_dim: dg in the paper (optimal = 30 for ViT-B/16)
-    drop_prob: stochastic gaze disabling during training
-               (paper: ~50% samples without gaze)
+    bottleneck_dim: d' in the paper
+    gaze_hidden_dim: dg (gaze token embedding dim)
+    drop_prob: stochastic gaze disabling during training (p in {0,1})
     strength: scale applied to injected residual
+    train_only: when True, disables gaze injection in eval() (val/test)
     """
     enabled: bool = False
     bottleneck_dim: int = 20
     gaze_hidden_dim: int = 30
     conv_hidden_channels: int = 64
-    drop_prob: float = 0
+    drop_prob: float = 0.0
     strength: float = 1.0
+    train_only: bool = False
+
 
 
 class GIIInjectorLayer(nn.Module):
@@ -914,7 +916,10 @@ def forward_backbone_tokens(
     )
     if egvit_enabled and bool(getattr(egvit_cfg, "train_only", True)) and (not bool(backbone.training)):
         egvit_enabled = False
+    if guidance_enabled and bool(getattr(getattr(gii_layers[0], "cfg", None), "train_only", False)) and (not bool(backbone.training)):
+        guidance_enabled = False
 
+        
     if not (guidance_enabled or egvit_enabled):
         feats = backbone.forward_features(x) if hasattr(backbone, "forward_features") else backbone(x)
         return _normalize_backbone_output(feats)

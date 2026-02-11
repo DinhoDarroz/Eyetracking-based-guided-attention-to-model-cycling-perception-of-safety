@@ -72,7 +72,7 @@ parameters:
       #- "deit3_base_patch16_224"
       #- "vit_base_patch16_224"
       #- "vit_base_patch16_clip_224"
-      - "dinov2_base"
+      #- "dinov2_reg_base"
       #- "vgg"
       #- "convnext_base"
       #- "efficientnet_v2_s"
@@ -100,7 +100,7 @@ parameters:
   # E) Fine-tuning policy
   # ---------------------------------------------------------------------------
   finetune:
-    value: true
+    value: True
     
   num_ft_blocks:
     values: [4]
@@ -114,7 +114,7 @@ parameters:
     value: 8
     
   max_epochs:
-    value: 15
+    value: 25
   grad_clip:
     value: 0.0
 
@@ -194,7 +194,7 @@ parameters:
   early_stop_mode:
     value: min
   early_stop_patience:
-    value: 3
+    value: 6
   early_stop_min_delta:
     value: 0.0
   early_stop_start_epoch:
@@ -207,10 +207,16 @@ parameters:
     values: 
      #- disable
      - egvit
-     - guide
-     - diag
-     - align
+     #- guide
+     #- diag
+     #- align
      #- align+gaze
 
   attention_mode:
     values: ["last"]
+    
+  gaze_map_size:
+    value: auto
+    
+  egvit_keep_ratio:
+    values: [0.1, 0.2, 0.3, 0.4, 0.7, 0.9]
