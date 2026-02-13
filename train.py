@@ -205,11 +205,11 @@ def arg_parse():
     )
     # -------------------- GAZE GUIDANCE (Guide mode) --------------------
     parser.add_argument("--guidance_drop_prob", type=float, default=0.0, help="Stochastic gaze disable prob (guide mode).")
-    parser.add_argument("--guidance_strength", type=float, default=2.5, help="Scale applied to injected guidance residual.")
+    parser.add_argument("--guidance_strength", type=float, default=1.0, help="Scale applied to injected guidance residual.")
     parser.add_argument("--guidance_bottleneck_dim", type=int, default=20, help="GII bottleneck dim (d').")
     parser.add_argument("--guidance_gaze_hidden_dim", type=int, default=30, help="Gaze token embedding dim (dg).")
     parser.add_argument("--guidance_conv_hidden_channels", type=int, default=64, help="GFF conv hidden channels.")
-    parser.add_argument("--guide_train_only",nargs="?",const=True,default=False,type=str2bool,help="When True, disables Guide/GII gaze injection during eval() (validation/test).",)
+    parser.add_argument("--guide_train_only",nargs="?",const=True,default=True,type=str2bool,help="When True, disables Guide/GII gaze injection during eval() (validation/test).",)
 
 
     # -------------------- LR & OPTIMIZATION ------------------
@@ -382,12 +382,12 @@ def run_training_with_args(args, trial=None):
         df=comparisons_df,
         seed=args.seed,
         comparisons_path=args.comparisons,
-        splits_dir = "splits_eye",
+        #splits_dir = "splits_eye",
         train_pct=0.7,
         val_pct=0.1,
         test_pct=0.2,
-        load_if_exists=True,   # loads if files exist, otherwise splits
-        save_splits=False,
+        load_if_exists=False,   # loads if files exist, otherwise splits
+        save_splits=True,
     )
 
 

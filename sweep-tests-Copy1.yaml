@@ -27,7 +27,7 @@ parameters:
     value: "0,1"
 
   seed:
-    values: [43]
+    values: [7]
   log_wandb:
     value: true
   log_console:
@@ -52,7 +52,7 @@ parameters:
   # B) Dataset / Filtering
   # ---------------------------------------------------------------------------
   cities:
-    value: "berlin" #"berlin,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
+    value: "berlin" #,paris,munich,barcelona,london_uk_collideoscope,london_uk_gov"
 
   # ---------------------------------------------------------------------------
   # C) Model family / Objective
@@ -81,6 +81,7 @@ parameters:
 
   pooling:
     values:
+      #- concat
       #- patch_mean
       #- cls_max_concat
       #- mean
@@ -90,7 +91,7 @@ parameters:
       #- prefix_mean
       #- cls_reg_concat
       #- cls_reg_add
-      #- concat
+
       #- topk
       
   pool_k:
@@ -114,7 +115,7 @@ parameters:
     value: 8
     
   max_epochs:
-    value: 25
+    value: 15
   grad_clip:
     value: 0.0
 
@@ -194,7 +195,7 @@ parameters:
   early_stop_mode:
     value: min
   early_stop_patience:
-    value: 6
+    value: 3
   early_stop_min_delta:
     value: 0.0
   early_stop_start_epoch:
@@ -205,11 +206,12 @@ parameters:
   # ---------------------------------------------------------------------------
   gaze_mode:
     values: 
+     #- align
      #- disable
      - egvit
      #- guide
      #- diag
-     #- align
+
      #- align+gaze
 
   attention_mode:
@@ -219,4 +221,7 @@ parameters:
     value: auto
     
   egvit_keep_ratio:
-    values: [0.1, 0.2, 0.3, 0.4, 0.7, 0.9]
+    values: [0.05, 0.15, 0.25, 0.35, 0.45, 0.65, 0.85]
+    
+  egvit_train_only:
+    value: True

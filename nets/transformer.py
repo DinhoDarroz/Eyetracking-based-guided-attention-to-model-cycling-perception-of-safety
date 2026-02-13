@@ -246,6 +246,9 @@ class Transformer(nn.Module):
         # ----------------------------------------------------------------------------------
         self.guidance_cfg = self.cfg.guidance
         self.egvit_cfg = self.cfg.egvit
+        self.use_gaze_injection = bool(self.guidance_cfg.enabled)
+        self.use_egvit_masking = bool(self.egvit_cfg.enabled)
+
 
         self.gaze_embedder: Optional[GazeTokenEmbedder] = None
         self.gii_layers: Optional[nn.ModuleList] = None

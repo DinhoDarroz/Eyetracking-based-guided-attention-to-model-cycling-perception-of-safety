@@ -885,3 +885,105 @@ def scale_lr_and_eta_min_by_unfrozen_blocks(
         new_eta = float(eta_other)
 
     return new_lr, new_eta
+
+# -----------------------------
+# Optional: head-only initialization from checkpoint
+# -----------------------------
+from typing import Dict, Tuple
+
+def _unwrap_checkpoint_state(state: dict) -> dict:
+    # Common checkpoint formats:
+    #  - raw state_dict
+    #  - {"state_dict": ...}
+    #  - {"model": ...}
+    if not isinstance(state, dict):
+        raise TypeError("Checkpoint must be a dict loaded by torch.load().")
+
+    if "state_dict" in state and isinstance(state["state_dict"], dict):
+        return state["state_dict"]
+    if "model" in state and isinstance(state["model"], dict):
+        return state["model"]
+
+    # Heuristic: if values look like tensors, treat as raw state_dict
+    tensorish = 0
+    for v in state.values():
+        if hasattr(v, "shape") and hasattr(v, "dtype"):
+            tensorish += 1
+            if tensorish >= 3:
+                return state
+
+    return state
+
+
+def _normalize_state_keys_for_model(model: torch.nn.Module, sd: dict) -> dict:
+    is_dp = isinstance(model, torch.nn.DataParallel)
+
+    has_module_prefix = any(k.startswith("module.") for k in sd.keys())
+    if (not is_dp) and has_module_prefix:
+        sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
+    if is_dp and (not has_module_prefix):
+        sd = {f"module.{k}": v for k, v in sd.items()}
+    return sd
+
+
+def _load_head_from_checkpoint(
+    model: torch.nn.Module,
+    ckpt_path: str,
+    *,
+    verbose: bool = True,
+) -> Tuple[int, int, Dict[str, str]]:
+    """
+    Loads only the Transformer "head" parameters (ranking + cross heads + norms),
+    filtering by both name and shape.
+
+    Returns:
+        (loaded_count, skipped_count, skip_reasons)
+    """
+    if (ckpt_path is None) or (str(ckpt_path).strip() == ""):
+        return 0, 0, {}
+
+    raw = torch.load(str(ckpt_path), map_location="cpu")
+    sd = _unwrap_checkpoint_state(raw)
+    sd = _normalize_state_keys_for_model(model, sd)
+
+    model_sd = model.state_dict()
+
+    head_prefixes = (
+        "rank_fc_",
+        "cross_fc_",
+        "feat_norm",
+        "pair_norm",
+    )
+
+    to_load = {}
+    skipped = {}
+    for k, v in sd.items():
+        if not k.startswith(head_prefixes):
+            continue
+        if k not in model_sd:
+            skipped[k] = "missing_in_target"
+            continue
+        if tuple(v.shape) != tuple(model_sd[k].shape):
+            skipped[k] = f"shape_mismatch src={tuple(v.shape)} dst={tuple(model_sd[k].shape)}"
+            continue
+        to_load[k] = v
+
+    missing_keys, unexpected_keys = model.load_state_dict(to_load, strict=False)
+
+    if verbose:
+        print("\n[init_head] checkpoint:", ckpt_path)
+        print(f"[init_head] matched head tensors: {len(to_load)}")
+        print(f"[init_head] skipped head tensors: {len(skipped)}")
+        if len(skipped) > 0:
+            show = list(skipped.items())[:20]
+            print("[init_head] first skips:")
+            for kk, reason in show:
+                print("  -", kk, "=>", reason)
+        if len(unexpected_keys) > 0:
+            print("[init_head] unexpected_keys from partial load:", unexpected_keys[:20])
+        if len(missing_keys) > 0:
+            # missing_keys is expected because strict=False and only partial dict is loaded
+            pass
+        print()
+
+    return len(to_load), len(skipped), skipped
