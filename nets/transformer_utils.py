@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Sequence
 from collections import deque
 
 import torch
@@ -167,18 +167,21 @@ def infer_patch_grid(backbone: nn.Module, num_patches: Optional[int] = None) -> 
 class AttentionConfig:
     """
     mode:
-      - "raw":    last block CLS->patch attention (head-averaged)
+      - "raw":     CLS→patch attention from a selected transformer block (head-averaged)
       - "rollout": rollout across blocks (identity-augmented, row-normalized)
-      - "topk":    "last" attention sparsified to top-k patches
 
-    out_hw:
-      attention map spatial output size (H,W), typically gaze grid size.
+    layer:
+      Block index used when mode="raw".
+      -1 selects the last captured attention (default).
+      >=0 selects the 0-based block index in forward order.
+      <=-2 selects relative to the end (e.g., -2 is penultimate).
     """
     enabled: bool = False
     return_attn: bool = True
-    mode: str = "raw"                  # {"last","rollout","topk"}
-    topk: Optional[int] = None
+    mode: str = "raw"                  # {"raw","rollout"}
+    layer: int = -1
     out_hw: Tuple[int, int] = (14, 14)
+
 
 
 class AttentionRecorder:
@@ -264,48 +267,74 @@ class AttentionRecorder:
 
     def begin_capture(self) -> None:
         self.reset()
-        local_mats: List[torch.Tensor] = []
-        self._active_attn_sink = local_mats
+        self._active_attn_sink = []
         self._active_last_attn = None
+        self._active_call_idx = 0
+    
+        if str(getattr(self.cfg, "mode", "raw")) == "raw":
+            layer = int(getattr(self.cfg, "layer", -1))
+            if layer < -1:
+                self._active_tail_k = max(1, -layer)
+
 
     def end_capture(self) -> None:
         self._attn_mats = [] if self._active_attn_sink is None else list(self._active_attn_sink)
         self._last_attn = self._active_last_attn
         self._active_attn_sink = None
         self._active_last_attn = None
+        self._active_call_idx = 0
+        self._active_tail_k = 0
+
 
     def _hook_attention_module(self, mod: nn.Module) -> None:
         mid = id(mod)
         if mid in self._original_attn_forwards:
             return
-
+    
         orig_forward = mod.forward
         self._original_attn_forwards[mid] = orig_forward
-
+    
         def _store_attn(attn_pre: torch.Tensor) -> None:
             attn_store = attn_pre if self._keep_grad else attn_pre.detach()
             self._active_last_attn = attn_store
-            if (self.cfg.mode == "rollout") and (self._active_attn_sink is not None):
+    
+            if self._active_attn_sink is None:
+                self._active_call_idx += 1
+                return
+    
+            mode = str(getattr(self.cfg, "mode", "raw"))
+            if mode == "rollout":
                 self._active_attn_sink.append(attn_store)
-
+            elif mode == "raw":
+                layer = int(getattr(self.cfg, "layer", -1))
+                if layer >= 0:
+                    if self._active_call_idx == layer:
+                        self._active_attn_sink.append(attn_store)
+                elif layer < -1:
+                    self._active_attn_sink.append(attn_store)
+                    if self._active_tail_k > 0 and len(self._active_attn_sink) > self._active_tail_k:
+                        self._active_attn_sink.pop(0)
+    
+            self._active_call_idx += 1
+    
         def _compute_attn_pre_from_x(x_in: torch.Tensor, _mod=mod) -> Optional[torch.Tensor]:
             if x_in.ndim != 3:
                 return None
-
+    
             b, n, c = x_in.shape
             num_heads = int(getattr(_mod, "num_heads", 0))
             if num_heads <= 0 or (c % num_heads) != 0:
                 return None
-
+    
             head_dim = c // num_heads
             qkv = _mod.qkv(x_in)
             qkv = qkv.reshape(b, n, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
             q, k = qkv[0], qkv[1]
-
+    
             scale = getattr(_mod, "scale", head_dim ** -0.5)
             attn_logits = (q @ k.transpose(-2, -1)) * scale
             return attn_logits.softmax(dim=-1)
-
+    
         def wrapped_forward(
             x: torch.Tensor,
             *args: Any,
@@ -316,10 +345,10 @@ class AttentionRecorder:
             want_attn = bool(self.cfg.enabled and self.cfg.return_attn)
             if not want_attn:
                 return _orig(x, *args, **kwargs)
-
+    
             if args or kwargs:
                 out = _orig(x, *args, **kwargs)
-
+    
                 self._fallback_calls += 1
                 if self._fallback_warned < 5:
                     self._fallback_warned += 1
@@ -327,47 +356,48 @@ class AttentionRecorder:
                         "Attention hook fallback triggered due to args/kwargs (mask/bias/etc). "
                         "Attention is approximated from qkv(x)."
                     )
-
+    
                 try:
                     attn_pre = _compute_attn_pre_from_x(x, _mod=_mod)
                     if attn_pre is not None:
                         _store_attn(attn_pre)
                 except Exception:
                     pass
-
+    
                 return out
-
+    
             try:
                 if x.ndim != 3:
                     return _orig(x, *args, **kwargs)
-
+    
                 b, n, c = x.shape
                 num_heads = int(getattr(_mod, "num_heads", 0))
                 if num_heads <= 0 or (c % num_heads) != 0:
                     return _orig(x, *args, **kwargs)
-
+    
                 head_dim = c // num_heads
-
+    
                 qkv = _mod.qkv(x)
                 qkv = qkv.reshape(b, n, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
                 q, k, v = qkv[0], qkv[1], qkv[2]
-
+    
                 scale = getattr(_mod, "scale", head_dim ** -0.5)
                 attn_logits = (q @ k.transpose(-2, -1)) * scale
                 attn_pre = attn_logits.softmax(dim=-1)
-
+    
                 attn_fwd = _mod.attn_drop(attn_pre) if hasattr(_mod, "attn_drop") else attn_pre
                 _store_attn(attn_pre)
-
+    
                 out = (attn_fwd @ v).transpose(1, 2).reshape(b, n, c)
                 out = _mod.proj(out) if hasattr(_mod, "proj") else out
                 out = _mod.proj_drop(out) if hasattr(_mod, "proj_drop") else out
                 return out
             except Exception:
                 return _orig(x, *args, **kwargs)
-
+    
         mod.forward = wrapped_forward
         self._hooked_modules.append(mod)
+
 
     @staticmethod
     def _patch_vector_to_map(
@@ -375,33 +405,22 @@ class AttentionRecorder:
         out_hw: Tuple[int, int],
         device: torch.device,
         dtype: torch.dtype,
-        mode: str,
-        topk: Optional[int],
     ) -> torch.Tensor:
         b, p = patch_scores.shape
         patch_scores = patch_scores.to(device=device, dtype=dtype)
-
-        if mode == "topk":
-            k = topk
-            if k is None:
-                k = max(1, int(0.10 * p))
-            k = max(1, min(int(k), p))
-            thr = patch_scores.topk(k, dim=1).values[:, -1].unsqueeze(1)
-            patch_scores = torch.where(patch_scores >= thr, patch_scores, torch.zeros_like(patch_scores))
-            s = patch_scores.sum(dim=1, keepdim=True).clamp_min(1e-12)
-            patch_scores = patch_scores / s
-
+    
         grid = int(math.isqrt(p))
         h, w = int(out_hw[0]), int(out_hw[1])
-
+    
         if grid * grid == p:
             m = patch_scores.view(b, 1, grid, grid)
             return F.interpolate(m, size=(h, w), mode="bilinear", align_corners=False)
-
+    
         m = patch_scores.view(b, 1, p, 1)
         m = F.interpolate(m, size=(h, 1), mode="bilinear", align_corners=False)
         m = F.interpolate(m, size=(h, w), mode="bilinear", align_corners=False)
         return m
+
 
     def attention_map_and_meta(
         self,
@@ -411,22 +430,28 @@ class AttentionRecorder:
     ) -> Tuple[Optional[torch.Tensor], bool]:
         if not (self.cfg.enabled and self.cfg.return_attn):
             return None, False
-
+    
         out_hw_eff = self.cfg.out_hw if out_hw is None else tuple(out_hw)
-
+    
         if self.cfg.mode == "rollout":
             m = self._attention_rollout_map(feats_for_dtype, num_prefix_tokens, out_hw_eff)
         else:
             m = self._attention_last_map(feats_for_dtype, num_prefix_tokens, out_hw_eff)
-
+    
         used_uniform = False
         if m is None:
             b = int(feats_for_dtype.shape[0])
-            m = uniform_attention_map(b=b, out_hw=out_hw_eff, device=feats_for_dtype.device, dtype=feats_for_dtype.dtype)
+            m = uniform_attention_map(
+                b=b,
+                out_hw=out_hw_eff,
+                device=feats_for_dtype.device,
+                dtype=feats_for_dtype.dtype,
+            )
             used_uniform = True
-
+    
         self._last_used_uniform = bool(used_uniform)
         return m, used_uniform
+
 
     def _attention_last_map(
         self,
@@ -434,24 +459,37 @@ class AttentionRecorder:
         num_prefix_tokens: int,
         out_hw: Tuple[int, int],
     ) -> Optional[torch.Tensor]:
-        if self._last_attn is None:
+        attn_src: Optional[torch.Tensor] = None
+    
+        if str(getattr(self.cfg, "mode", "raw")) != "raw":
+            attn_src = self._last_attn
+        else:
+            layer = int(getattr(self.cfg, "layer", -1))
+            if layer == -1:
+                attn_src = self._last_attn
+            elif layer >= 0:
+                attn_src = self._attn_mats[0] if (len(self._attn_mats) > 0) else self._last_attn
+            else:
+                if len(self._attn_mats) >= abs(layer):
+                    attn_src = self._attn_mats[layer]
+                else:
+                    attn_src = self._last_attn
+    
+        if attn_src is None:
             return None
-
-        attn = self._last_attn.mean(dim=1)  # (B,N,N)
+    
+        attn = attn_src.mean(dim=1)  # (B,N,N)
         if attn.shape[-1] <= int(num_prefix_tokens):
             return None
-
+    
         patch_scores = attn[:, 0, int(num_prefix_tokens):]  # (B,P)
         patch_scores = patch_scores / patch_scores.sum(dim=1, keepdim=True).clamp_min(1e-12)
-
-        mode = "topk" if (self.cfg.mode == "topk") else "raw"
+    
         return self._patch_vector_to_map(
             patch_scores,
             out_hw=out_hw,
             device=feats_for_dtype.device,
             dtype=feats_for_dtype.dtype,
-            mode=mode,
-            topk=self.cfg.topk,
         )
 
     def _attention_rollout_map(
@@ -462,47 +500,46 @@ class AttentionRecorder:
     ) -> Optional[torch.Tensor]:
         if len(self._attn_mats) == 0:
             return None
-
+    
         device = feats_for_dtype.device
         out_dtype = feats_for_dtype.dtype
-
+    
         mats: List[torch.Tensor] = []
         for a in self._attn_mats:
             A = a.mean(dim=1)  # (B,N,N)
             if A.device != device:
                 A = A.to(device)
             mats.append(A)
-
+    
         b, n, _ = mats[0].shape
         I = torch.eye(n, device=device, dtype=mats[0].dtype).unsqueeze(0).expand(b, -1, -1)
-
+    
         mats_hat: List[torch.Tensor] = []
         for A in mats:
             A = A + I
             A = A / A.sum(dim=-1, keepdim=True).clamp_min(1e-12)
             mats_hat.append(A)
-
+    
         R = mats_hat[0]
         for A in mats_hat[1:]:
             R = R @ A
-
+    
         if R.shape[-1] <= int(num_prefix_tokens):
             return None
-
+    
         patch_scores = R[:, 0, int(num_prefix_tokens):]  # (B,P)
         patch_scores = patch_scores / patch_scores.sum(dim=1, keepdim=True).clamp_min(1e-12)
-
+    
         if patch_scores.dtype != out_dtype:
             patch_scores = patch_scores.to(dtype=out_dtype)
-
+    
         return self._patch_vector_to_map(
             patch_scores,
             out_hw=out_hw,
             device=device,
             dtype=out_dtype,
-            mode="rollout",
-            topk=None,
         )
+
 
 
 # ================================================================================================
@@ -877,6 +914,7 @@ def forward_backbone_tokens(
     attention_recorder: Optional[Any] = None,
     gaze_embedder: Optional["GazeTokenEmbedder"] = None,
     gii_layers: Optional[nn.ModuleList] = None,
+    gii_active_indices: Optional[Sequence[int]] = None,
     gaze_map: Optional[torch.Tensor] = None,
     has_eye_mask: Optional[torch.Tensor] = None,
     num_prefix_tokens: int = 1,
@@ -1002,6 +1040,16 @@ def forward_backbone_tokens(
     
         n_hook = min(len(blocks), len(gii_layers))
     
+        if gii_active_indices is None:
+            hook_indices = list(range(n_hook))
+        else:
+            hook_indices: List[int] = []
+            for i in gii_active_indices:
+                j = int(i)
+                if 0 <= j < n_hook:
+                    hook_indices.append(j)
+            hook_indices = sorted(set(hook_indices))
+    
         def _make_guide_hooks(layer_idx: int, blk: nn.Module):
             state: Dict[str, Any] = {"x_in": None, "dp_calls": 0, "res1": None}
             dp1 = _resolve_drop_path(blk, which=1)
@@ -1054,7 +1102,7 @@ def forward_backbone_tokens(
     
             return dp1, _blk_pre_hook, _dp1_hook, _blk_post_hook
     
-        for layer_idx in range(n_hook):
+        for layer_idx in hook_indices:
             blk = blocks[layer_idx]
             dp1, pre_hook, dp_hook, post_hook = _make_guide_hooks(layer_idx, blk)
     

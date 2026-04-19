@@ -246,6 +246,61 @@ def read_data(args):
 
     return comparisons_df
 
+
+def apply_backbone_hparam_overrides(args) -> None:
+    """
+    Override selected hyperparameters based on backbone.
+
+    Current policy:
+      - dinov3_vitb16            -> num_ft_blocks=4, ranking_margin=2.0
+      - deit3_base_patch16_224   -> num_ft_blocks=4, ranking_margin=2.0
+      - vit_base_patch16_224     -> num_ft_blocks=8, ranking_margin=3.2
+
+    Only modifies attributes when the backbone is explicitly listed here.
+    Also keeps ranking_margin_ties aligned when it was not explicitly set.
+    """
+    backbone = str(getattr(args, "backbone", "")).strip().lower()
+
+    overrides = {
+        "dinov3_vitb16": {
+            "num_ft_blocks": 4,
+            "ranking_margin": 2.0,
+        },
+        "deit3_base_patch16_224": {
+            "num_ft_blocks": 4,
+            "ranking_margin": 2.0,
+        },
+        "vit_base_patch16_224": {
+            "num_ft_blocks": 8,
+            "ranking_margin": 3.2,
+        },
+    }
+
+    cfg = overrides.get(backbone)
+    if cfg is None:
+        return
+
+    old_num_ft_blocks = getattr(args, "num_ft_blocks", None)
+    old_ranking_margin = getattr(args, "ranking_margin", None)
+    old_ranking_margin_ties = getattr(args, "ranking_margin_ties", None)
+
+    args.num_ft_blocks = int(cfg["num_ft_blocks"])
+    args.ranking_margin = float(cfg["ranking_margin"])
+
+    # Keep ties margin synchronized when it was not explicitly set.
+    if old_ranking_margin_ties is None:
+        args.ranking_margin_ties = float(args.ranking_margin)
+
+    args._backbone_override_info = {
+        "backbone": backbone,
+        "applied": True,
+        "old_num_ft_blocks": old_num_ft_blocks,
+        "new_num_ft_blocks": args.num_ft_blocks,
+        "old_ranking_margin": old_ranking_margin,
+        "new_ranking_margin": args.ranking_margin,
+        "old_ranking_margin_ties": old_ranking_margin_ties,
+        "new_ranking_margin_ties": getattr(args, "ranking_margin_ties", None),
+    }
     
 def _boolish_series_to_bool_mask(s: pd.Series) -> pd.Series:
     return s.astype(str).str.lower().str.strip().isin(["1", "true", "t", "yes", "y"])
@@ -905,7 +960,7 @@ def _build_model(args, backbone_model, use_gaze_loss: bool, is_cnn_backbone: boo
         use_attn_hook=bool(need_attn_maps),
         return_attn=bool(need_attn_maps),
         attention_mode=args.attention_mode,
-        attn_topk=args.attn_topk,
+        attn_layer=int(getattr(args, "attn_layer", -1)),
         attn_out_hw=tuple(gaze_grid_hw),
         use_gaze_injection=bool(use_gaze_inj),
         guidance_cfg=guidance_cfg,

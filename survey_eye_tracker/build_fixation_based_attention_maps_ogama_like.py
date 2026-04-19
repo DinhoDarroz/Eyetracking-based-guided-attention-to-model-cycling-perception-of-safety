@@ -14,13 +14,13 @@ OGAMA-aligned properties:
 - Uses FIXATIONS (stats_fixations.txt)
 - Weights by fixation duration (Length)
 - Gaussian blur in SCREEN PIXEL space (before ROI cropping)
-- No log scaling
-- No per-image min/max normalization for saved NPYS (uses sum-to-1 normalization)
+- Optional normalization (sum-to-1 probability) or raw values.
 
 Notes:
 - cv2.resize expects target size as (width, height)
 - When map_res="orig", ROI native resolution is used (e.g., 864x508 for the provided ROIs)
 """
+
 
 import os
 import json
@@ -38,6 +38,8 @@ import cv2
 # =====================================================================================
 
 DEFAULT_OUT_DIR = "/home/csantiago/survey_eye_tracker/Eyetracker_attention_maps"
+# FIXED: Added missing slash in path
+DEFAULT_USERS_PATH = "/home/csantiago/survey_eye_tracker/eye_tracker_data"
 MAX_COMPARISONS_DEFAULT = 65
 
 logging.basicConfig(
@@ -45,6 +47,7 @@ logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s'
 )
 
+# List of user session folders (relative to base_dir)
 # List of user session folders (relative to base_dir)
 USERS = [
     "cycling932844b29e6175a85d195cbee96ce34057d0b2cb0b9bb90018e0301ef2460b82/2022_10_10_12_39_43",
@@ -72,6 +75,7 @@ USERS = [
     "cycling14fd071ffaf930135bd748b9623a06847a49559438ae21c6cd8845252bae5462/2022_12_09_11_29_21",
 ]
 
+
 # =====================================================================================
 # CLI
 # =====================================================================================
@@ -80,26 +84,34 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Build OGAMA-like fixation-based gaze maps (with selectable output resolution)."
     )
-    p.add_argument('--base_dir', required=True,
-                   help='Root directory containing cycling... folders')
+    # FIXED: Made base_dir optional with default
+    p.add_argument('--base_dir', required=False, default=DEFAULT_USERS_PATH,
+                   help=f'Root directory containing cycling... folders (Default: {DEFAULT_USERS_PATH})')
+    
     p.add_argument('--out_dir', default=DEFAULT_OUT_DIR,
                    help='Root output directory')
     p.add_argument('--blur_sigma', type=float, default=40.0,
                    help='Gaussian sigma in SCREEN PIXELS (30–60 typical for 1920x1200)')
     p.add_argument('--max_comparisons', type=int, default=MAX_COMPARISONS_DEFAULT,
                    help='Limit comparisons per session')
+    
+    # OUTPUT CONTROL
     p.add_argument('--npy_only', action='store_true',
                    help='Only save .npy files (skip PNG overlays)')
+    
+    # NORMALIZATION CONTROL
+    p.add_argument('--no_norm', action='store_true',
+                   help='If set, do NOT normalize maps to sum-to-1 probability. Saves raw fixation weighted sums.')
 
     # Main output map resolution (saved as .npy). Options:
-    #   - "orig"     -> use ROI native size per-side (e.g., 864x508)
-    #   - "WxH"      -> custom fixed size (e.g., 224x224, 864x508)
+    #   - "orig"      -> use ROI native size per-side (e.g., 864x508)
+    #   - "WxH"       -> custom fixed size (e.g., 224x224, 864x508)
     p.add_argument('--map_res', default="224x224",
                    help='Primary saved map resolution: "orig" or "WxH" (e.g., 864x508, 224x224)')
 
     # Optional patch-grid output resolution (also saved as .npy). Options:
-    #   - "none"     -> disabled
-    #   - "WxH"      -> e.g., 14x14, 16x16
+    #   - "none"      -> disabled
+    #   - "WxH"       -> e.g., 14x14, 16x16
     p.add_argument('--grid_res', default="none",
                    help='Optional patch-grid map resolution: "none" or "WxH" (e.g., 14x14)')
 
@@ -228,6 +240,7 @@ def save_roi_overlay_from_map(out_path: str, roi_map: np.ndarray, roi_bgr: np.nd
         return
 
     heat = roi_map.astype(np.float32).copy()
+    # For visualization, we always normalize min-max locally to see the heatmap structure
     heat -= heat.min()
     m = float(heat.max())
     if m > 0:
@@ -283,6 +296,7 @@ def main():
     total_saved_grid = 0
 
     for survey_num, rel_path in enumerate(USERS, start=1):
+        # Use args.base_dir which defaults to DEFAULT_USERS_PATH
         survey_dir = os.path.join(args.base_dir, rel_path)
         if not os.path.isdir(survey_dir):
             continue
@@ -338,13 +352,20 @@ def main():
                     if map_res_wh is None:
                         raise ValueError(f"Invalid map_res: {args.map_res}")
 
-                # Crop ROI from blurred full_map, resize, then normalize to probability
+                # Crop ROI from blurred full_map, resize
                 roi_map = crop_roi(full_map, roi_xy)
                 if roi_map.size == 0:
                     continue
 
                 map_res_map = resize_any(roi_map, map_res_wh).astype(np.float32)
-                map_prob = normalize_to_prob(map_res_map)
+
+                # === NORMALIZATION LOGIC ===
+                if args.no_norm:
+                    map_prob = map_res_map # RAW values
+                else:
+                    map_prob = normalize_to_prob(map_res_map) # Sum-to-1
+                # ===========================
+
                 if float(map_prob.sum()) <= 0.0:
                     continue
 
@@ -362,7 +383,14 @@ def main():
                     os.makedirs(grid_out_dir, exist_ok=True)
 
                     grid_map = resize_any(map_prob, grid_res_wh).astype(np.float32)
-                    grid_prob = normalize_to_prob(grid_map)
+
+                    # === NORMALIZATION LOGIC FOR GRID ===
+                    if args.no_norm:
+                        grid_prob = grid_map # RAW values
+                    else:
+                        grid_prob = normalize_to_prob(grid_map) # Sum-to-1
+                    # ====================================
+
                     if float(grid_prob.sum()) > 0.0:
                         np.save(os.path.join(grid_out_dir, name_npy), grid_prob)
                         total_saved_grid += 1

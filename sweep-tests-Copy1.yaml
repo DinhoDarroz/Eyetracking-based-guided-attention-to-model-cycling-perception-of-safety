@@ -20,14 +20,15 @@ parameters:
   cuda:
     value: true
   cuda_id:
-    value: 1
+    value: 0
   multi_gpu:
-    value: false
+    value: False
   gpu_ids:
     value: "0,1"
 
   seed:
-    values: [43]
+    values: [54, 321, 513, 705, 912]
+    #values: [54, 187, 321, 492, 513, 678, 705, 844, 912, 998]
   log_wandb:
     value: true
   log_console:
@@ -104,7 +105,7 @@ parameters:
     value: True
     
   num_ft_blocks:
-    values: [7]
+    values: [4]
 
   # ---------------------------------------------------------------------------
   # F) Batch / Training length
@@ -140,17 +141,14 @@ parameters:
   # H) Ranking / Loss weights
   # ---------------------------------------------------------------------------
   ranking_margin:
-    values: [0.4]
-
-#  ranking_margin_ties:
-#    value: 0.7
+    values: [5.6]
   rank_w:
     value: 1
 
   ties_w:
     value: 10.0
   attn_w:
-    values: [1]
+    values: [0.01, 0.5]
 
   label_smoothing:
     value: 0.0
@@ -206,25 +204,26 @@ parameters:
   # ---------------------------------------------------------------------------
   gaze_mode:
     values: 
-     #- align
+     #- guide
+     - align
      #- disable
-     - egvit
-     - guide
+     #- egvit
      #- diag
-
      #- align+gaze
 
   attention_mode:
-    values: ["raw"]
+    values: ["rollout"]
+  attn_layer:
+    values: [-1]
     
   gaze_map_size:
     value: auto
     
   train_gaze_frac:
-    value: 1.0 
+    values: [0.7] 
     
   egvit_keep_ratio:
-    values: [0.35]
+    values: [0.25]
     
   egvit_train_only:
     value: True

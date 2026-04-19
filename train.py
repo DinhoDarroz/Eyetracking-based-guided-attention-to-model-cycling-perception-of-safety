@@ -22,6 +22,7 @@ from train_main_utils import (
     initialize_logging,
     initialize_wandb,
     read_data,
+    apply_backbone_hparam_overrides,
     _boolish_series_to_bool_mask,
     _ensure_dir,
     _split_paths,
@@ -186,12 +187,18 @@ def arg_parse():
         "  topk    : raw-block CLS→patch attention, sparsified to top-k tokens"
         ),
     )
-    parser.add_argument("--attn_topk", type=int,default=None,
-    help=(
-        "Number of patch tokens to keep when --attention_mode=topk. "
-        "If None, all tokens are used."
+    parser.add_argument(
+        "--attn_layer",
+        type=int,
+        default=-1,
+        help=(
+            "Transformer block index used when --attention_mode=raw. "
+            "-1 selects last block (default); "
+            ">=0 selects 0-based block index; "
+            "<=-2 selects relative to the end (e.g., -2 is penultimate)."
         ),
     )
+
 
     parser.add_argument("--cities", type=str, default="all")
 
@@ -355,6 +362,13 @@ def run_training_with_args(args, trial=None):
     # ==============================================================================================
     validate_and_normalize_args(args, strict=False, verbose=True)
     #args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=2e-5)
+    apply_backbone_hparam_overrides(args)
+    print(
+    f"[DEBUG backbone overrides] backbone={args.backbone} "
+    f"num_ft_blocks={args.num_ft_blocks} "
+    f"ranking_margin={args.ranking_margin} "
+    f"ranking_margin_ties={args.ranking_margin_ties}"
+    )
 
     print("=== Args ===")
     print(args, "\n")
@@ -389,13 +403,13 @@ def run_training_with_args(args, trial=None):
         df=comparisons_df,
         seed=args.seed,
         comparisons_path=args.comparisons,
-        splits_dir = "splits_eye",
+        splits_dir = "splits",
         train_pct=0.7,
         val_pct=0.1,
         test_pct=0.2,
-        load_if_exists=True,   # loads if files exist, otherwise splits
-        save_splits=False,
-        train_gaze_frac=args.train_gaze_frac,
+        load_if_exists=False,   # loads if files exist, otherwise splits
+        save_splits=True,
+        #train_gaze_frac=args.train_gaze_frac,
     )
 
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import torch
 import torch.nn as nn
@@ -57,7 +57,7 @@ class TransformerConfig:
         enabled=False,
         return_attn=True,
         mode="raw",
-        topk=None,
+        layer=-1,
         out_hw=(14, 14),
     )
 
@@ -100,7 +100,7 @@ class Transformer(nn.Module):
         use_attn_hook: bool = False,
         return_attn: bool = True,
         attention_mode: str = "raw",
-        attn_topk: Optional[int] = None,
+        attn_layer: int = -1,
         force_num_prefix_tokens: Optional[int] = None,
         apply_token_norm: bool = False,
         attn_out_hw: Optional[Tuple[int, int]] = None,
@@ -120,6 +120,10 @@ class Transformer(nn.Module):
         # ----------------------------------------------------------------------------------
         # Step 2) Build and validate config
         # ----------------------------------------------------------------------------------
+        attn_mode = str(attention_mode).lower().strip()
+        if attn_mode == "last":
+            attn_mode = "raw"
+
         cfg = TransformerConfig(
             model=str(model).lower().strip(),
             pooling=str(pooling).lower().strip(),
@@ -134,8 +138,8 @@ class Transformer(nn.Module):
             attention=AttentionConfig(
                 enabled=bool(use_attn_hook),
                 return_attn=bool(return_attn),
-                mode=str(attention_mode).lower().strip(),
-                topk=None if attn_topk is None else int(attn_topk),
+                mode=attn_mode,
+                layer=int(attn_layer),
                 out_hw=tuple(attn_out_hw) if attn_out_hw is not None else (14, 14),
             ),
             egvit=(
@@ -168,10 +172,14 @@ class Transformer(nn.Module):
             "topk",
         }
         if self.cfg.pooling not in allowed_poolings:
-            raise ValueError(f"Unknown pooling='{self.cfg.pooling}'. Expected one of: {sorted(allowed_poolings)}.")
+            raise ValueError(
+                f"Unknown pooling='{self.cfg.pooling}'. Expected one of: {sorted(allowed_poolings)}."
+            )
 
-        if self.cfg.attention.mode not in ("raw", "rollout", "topk"):
-            raise ValueError(f"Unknown attention_mode='{self.cfg.attention.mode}'. Expected: raw/rollout/topk.")
+        if self.cfg.attention.mode not in ("raw", "rollout"):
+            raise ValueError(
+                f"Unknown attention_mode='{self.cfg.attention.mode}'. Expected: raw/rollout."
+            )
 
         # ----------------------------------------------------------------------------------
         # Step 3) Runtime flags (controlled externally)
@@ -248,12 +256,12 @@ class Transformer(nn.Module):
         self.egvit_cfg = self.cfg.egvit
         self.use_gaze_injection = bool(self.guidance_cfg.enabled)
         self.use_egvit_masking = bool(self.egvit_cfg.enabled)
-
-
+        
+        self.gii_active_indices: Optional[List[int]] = None
         self.gaze_embedder: Optional[GazeTokenEmbedder] = None
         self.gii_layers: Optional[nn.ModuleList] = None
-
-        if self.guidance_cfg.enabled:
+        
+        if self.use_gaze_injection:
             blocks = getattr(self.backbone, "blocks", None)
             if blocks is not None and len(blocks) > 0:
                 self.gaze_embedder = GazeTokenEmbedder(token_dim=int(self.embed_dim))
@@ -267,11 +275,49 @@ class Transformer(nn.Module):
                         for _ in range(len(blocks))
                     ]
                 )
+        
+                #self._sync_gii_with_backbone_trainability()
+                for gii in self.gii_layers:
+                    for p in gii.parameters():
+                        p.requires_grad = True
+                self.gii_active_indices = None
 
     # -------------------------------------------------------------------------------------------------
     # Backbone finetune management
     # -------------------------------------------------------------------------------------------------
-
+    
+    def _sync_gii_with_backbone_trainability(self) -> None:
+        if self.gii_layers is None:
+            self.gii_active_indices = None
+            return
+    
+        blocks = getattr(self.backbone, "blocks", None)
+        if blocks is None:
+            self.gii_active_indices = []
+            for gii in self.gii_layers:
+                for p in gii.parameters():
+                    p.requires_grad = False
+            return
+    
+        n = min(len(blocks), len(self.gii_layers))
+        active = []
+        for i in range(n):
+            blk = blocks[i]
+            if any(p.requires_grad for p in blk.parameters()):
+                active.append(int(i))
+    
+        self.gii_active_indices = active
+        active_set = set(active)
+    
+        for i in range(n):
+            req = (i in active_set)
+            for p in self.gii_layers[i].parameters():
+                p.requires_grad = req
+    
+        for i in range(n, len(self.gii_layers)):
+            for p in self.gii_layers[i].parameters():
+                p.requires_grad = False
+                
     def _freeze_backbone(self) -> None:
         for p in self.backbone.parameters():
             p.requires_grad = False
@@ -407,6 +453,7 @@ class Transformer(nn.Module):
                 attention_recorder=self.attn_recorder,
                 gaze_embedder=self.gaze_embedder,
                 gii_layers=self.gii_layers,
+                gii_active_indices=self.gii_active_indices,
                 gaze_map=gaze_map,
                 has_eye_mask=has_eye_mask,
                 num_prefix_tokens=int(self.num_prefix_tokens),
