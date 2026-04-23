@@ -5,9 +5,9 @@ test.py
 Evaluate a trained checkpoint on a comparisons pickle.
 
 Configuration sources (priority order):
-  1) --wandb_config PATH
-  2) --wandb_run_id RUN_ID  (loads wandb/<run>/files/config.json if present, else wandb-metadata.json["args"])
-  3) manual CLI flags
+  1) models/<run_id>/ best/last checkpoint auto-discovery
+  2) local W&B config.json/config.yaml or wandb-metadata.json["args"]
+  3) explicit CLI overrides
 
 This script prints a structured run report so users can confirm:
   - where hyperparameters came from
@@ -22,9 +22,12 @@ import glob
 import json
 import os
 import pickle
+import re
+import sys
 import time
 import warnings
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -37,6 +40,8 @@ import torchvision.models as tv_models
 from scripts.test_script import test
 from data import ComparisonsDataset
 from train_main_utils import build_eval_transforms
+from train_main_utils import _build_model as build_train_model
+from train_main_utils import _build_transforms_and_specs
 
 from train_utils import (
     resolve_backbone,
@@ -121,6 +126,10 @@ def _find_wandb_run_files(run_id: str, wandb_dir: str = "wandb") -> dict:
     if not os.path.exists(config_json):
         config_json = None
 
+    config_yaml = os.path.join(files_dir, "config.yaml")
+    if not os.path.exists(config_yaml):
+        config_yaml = None
+
     metadata_json = os.path.join(files_dir, "wandb-metadata.json")
     if not os.path.exists(metadata_json):
         metadata_json = None
@@ -133,6 +142,7 @@ def _find_wandb_run_files(run_id: str, wandb_dir: str = "wandb") -> dict:
         "run_dir": run_dir,
         "files_dir": files_dir,
         "config_json": config_json,
+        "config_yaml": config_yaml,
         "metadata_json": metadata_json,
         "summary_json": summary_json,
     }
@@ -153,31 +163,181 @@ def _load_wandb_config_json(path: str) -> dict:
     return cfg
 
 
+def _load_wandb_config_yaml(path: str) -> dict:
+    try:
+        import yaml
+
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Cannot read {path}: PyYAML is not installed. "
+            "Install pyyaml or rely on wandb-metadata.json args."
+        ) from exc
+
+    cfg = {}
+    for k, v in raw.items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, dict) and "value" in v:
+            cfg[k] = v["value"]
+        else:
+            cfg[k] = v
+    return cfg
+
+
 def _apply_wandb_config_to_args(args, cfg: dict):
     mapping = {
         "architecture_backbone": "backbone",
         "architecture_model": "model",
+        "backbone": "backbone",
+        "model": "model",
         "finetune_backbone": "finetune",
+        "finetune": "finetune",
         "num_ft_blocks": "num_ft_blocks",
         "ties": "ties",
         "gaze_mode": "gaze_mode",
+        "eyetracker_filter": "eyetracker_filter",
         "rank_dropout": "rank_dropout",
         "cross_dropout": "cross_dropout",
         "attn_w": "attn_w",
+        "attn_layer": "attn_layer",
+        "attention_mode": "attention_mode",
+        "attn_topk": "attn_topk",
         "rank_w": "rank_w",
         "ties_w": "ties_w",
         "rank_margin": "ranking_margin",
         "rank_margin_ties": "ranking_margin_ties",
+        "ranking_margin": "ranking_margin",
+        "ranking_margin_ties": "ranking_margin_ties",
+        "pooling": "pooling",
+        "pool_k": "pool_k",
+        "cnn_pool": "cnn_pool",
+        "use_seg": "use_seg",
+        "full_accuracy": "full_accuracy",
+        "gaze_root": "gaze_root",
+        "gaze_map_size": "gaze_map_size",
+        "guidance_drop_prob": "guidance_drop_prob",
+        "guidance_strength": "guidance_strength",
+        "guidance_bottleneck_dim": "guidance_bottleneck_dim",
+        "guidance_gaze_hidden_dim": "guidance_gaze_hidden_dim",
+        "guidance_conv_hidden_channels": "guidance_conv_hidden_channels",
+        "guide_train_only": "guide_train_only",
+        "egvit_mask_type": "egvit_mask_type",
+        "egvit_keep_ratio": "egvit_keep_ratio",
+        "egvit_focus_hw": "egvit_focus_hw",
+        "egvit_drop_prob": "egvit_drop_prob",
+        "egvit_train_only": "egvit_train_only",
+        "comparisons": "comparisons",
+        "dataset": "dataset",
+        "cities": "cities",
+        "batch_size": "batch_size",
+        "seed": "seed",
     }
 
     for src_key, dst_attr in mapping.items():
         if src_key in cfg and cfg[src_key] is not None:
+            if dst_attr in getattr(args, "_cli_overrides", set()):
+                continue
             setattr(args, dst_attr, cfg[src_key])
 
-    for b in ["ties", "finetune"]:
+    for b in ["ties", "finetune", "use_seg", "full_accuracy", "guide_train_only", "egvit_train_only"]:
         v = getattr(args, b, False)
         if isinstance(v, str):
             setattr(args, b, v.lower() in ("1", "true", "yes", "y", "t"))
+
+
+def _run_dir_mtime(run_dir: Path) -> float:
+    pts = list(run_dir.glob("*.pt"))
+    files = pts or list(run_dir.iterdir())
+    return max((p.stat().st_mtime for p in files), default=run_dir.stat().st_mtime)
+
+
+def _select_latest_run_dir(model_dir: str) -> Path:
+    root = Path(model_dir)
+    candidates = [
+        p for p in root.iterdir()
+        if p.is_dir() and p.name != ".ipynb_checkpoints" and list(p.glob("*.pt"))
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"No trained run folders with .pt files found under '{model_dir}'.")
+    return max(candidates, key=_run_dir_mtime)
+
+
+def _read_run_info(run_dir: Path) -> Dict[str, Any]:
+    info_path = run_dir / "run_info.json"
+    if not info_path.exists():
+        return {}
+    with open(info_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _checkpoint_sort_key(path: Path) -> Tuple[int, float]:
+    numbers = [int(x) for x in re.findall(r"\d+", path.stem)]
+    epoch = numbers[0] if numbers else -1
+    return epoch, path.stat().st_mtime
+
+
+def _select_checkpoint_from_run(run_dir: Path, preference: str = "best") -> Path:
+    preference = str(preference or "best").lower().strip()
+    patterns = ["best_model_*.pt", "best*.pt"] if preference == "best" else ["last_model_*.pt", "last*.pt"]
+    matches: List[Path] = []
+    for pattern in patterns:
+        matches.extend(run_dir.glob(pattern))
+
+    if not matches and preference == "best":
+        return _select_checkpoint_from_run(run_dir, "last")
+    if not matches and preference == "last":
+        return _select_checkpoint_from_run(run_dir, "best")
+    if not matches:
+        raise FileNotFoundError(f"No checkpoint files found in '{run_dir}'.")
+
+    return sorted(set(matches), key=_checkpoint_sort_key)[-1]
+
+
+def _resolve_run_and_checkpoint(args) -> Dict[str, Any]:
+    details: Dict[str, Any] = {}
+
+    run_dir: Optional[Path] = None
+    if args.run_id:
+        run_dir = Path(args.model_dir) / args.run_id
+        if not run_dir.exists():
+            raise FileNotFoundError(f"Run folder not found: {run_dir}")
+    elif args.checkpoint is None:
+        run_dir = _select_latest_run_dir(args.model_dir)
+    else:
+        ckpt_parent = Path(args.checkpoint).parent
+        if str(ckpt_parent) == ".":
+            ckpt_parent = Path(args.model_dir) / ckpt_parent
+        if (ckpt_parent / "run_info.json").exists():
+            run_dir = ckpt_parent
+
+    if run_dir is not None:
+        info = _read_run_info(run_dir)
+        args.run_id = args.run_id or info.get("run_id") or run_dir.name
+        args.wandb_run_id = args.wandb_run_id or args.run_id
+        if args.checkpoint is None:
+            args.checkpoint = str(_select_checkpoint_from_run(run_dir, args.checkpoint_kind))
+        elif not os.path.isabs(args.checkpoint) and not os.path.exists(args.checkpoint):
+            run_candidate = run_dir / args.checkpoint
+            if run_candidate.exists():
+                args.checkpoint = str(run_candidate)
+        details.update({
+            "run_dir": str(run_dir),
+            "run_id": args.run_id,
+            "run_name": info.get("run_name"),
+            "checkpoint_kind": args.checkpoint_kind,
+        })
+
+    if args.checkpoint is None:
+        raise ValueError("No checkpoint selected. Provide --run_id, --checkpoint, or keep trained runs under --model_dir.")
+
+    if not os.path.isabs(args.checkpoint) and not os.path.exists(args.checkpoint):
+        candidate = os.path.join(args.model_dir, args.checkpoint)
+        if os.path.exists(candidate):
+            args.checkpoint = candidate
+
+    return details
 
 def _load_metadata_args_list(metadata_path: str) -> List[str]:
     with open(metadata_path, "r", encoding="utf-8") as f:
@@ -194,6 +354,11 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
 
     p.add_argument("--model", type=str)
     p.add_argument("--backbone", type=str)
+    p.add_argument("--comparisons", type=str)
+    p.add_argument("--dataset", type=str)
+    p.add_argument("--cities", type=str)
+    p.add_argument("--batch_size", type=int)
+    p.add_argument("--seed", type=int)
 
     p.add_argument("--finetune", nargs="?", const=True, type=str2bool)
 
@@ -215,13 +380,27 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
     p.add_argument("--pool_k", type=int)
     p.add_argument("--use_seg", nargs="?", const=True, type=str2bool)
     p.add_argument("--full_accuracy", nargs="?", const=True, type=str2bool)
+    p.add_argument("--eyetracker_filter", type=str)
 
     p.add_argument("--gaze_root", type=str)
     p.add_argument("--gaze_subdir_fmt", type=str)
     p.add_argument("--gaze_map_size", type=str)
 
     p.add_argument("--attention_mode", type=str)
+    p.add_argument("--attn_layer", type=int)
     p.add_argument("--attn_topk", type=int)
+
+    p.add_argument("--guidance_drop_prob", type=float)
+    p.add_argument("--guidance_strength", type=float)
+    p.add_argument("--guidance_bottleneck_dim", type=int)
+    p.add_argument("--guidance_gaze_hidden_dim", type=int)
+    p.add_argument("--guidance_conv_hidden_channels", type=int)
+    p.add_argument("--guide_train_only", nargs="?", const=True, type=str2bool)
+    p.add_argument("--egvit_mask_type", type=str)
+    p.add_argument("--egvit_keep_ratio", type=float)
+    p.add_argument("--egvit_focus_hw", type=int, nargs=2)
+    p.add_argument("--egvit_drop_prob", type=float)
+    p.add_argument("--egvit_train_only", nargs="?", const=True, type=str2bool)
 
     p.add_argument("--use_class_weights", nargs="?", const=True, type=str2bool)
     p.add_argument("--label_smoothing", type=float)
@@ -233,6 +412,8 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
 
     for k, v in vars(known).items():
         if v is None:
+            continue
+        if k in getattr(args, "_cli_overrides", set()):
             continue
         setattr(args, k, v)
 
@@ -315,7 +496,8 @@ def read_data(args) -> Tuple[pd.DataFrame, Dict[str, Any]]:
             .fillna(False)
             .astype(bool)
         )
-        if bool(getattr(args, "eyetracker_only", False)):
+        if str(getattr(args, "eyetracker_filter", "all")).lower().strip() == "only":
+            gaze_only_kept = int(df["has_eyetracker"].sum())
             df = df[df["has_eyetracker"].astype(bool)]
 
 
@@ -502,12 +684,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="Checkpoint evaluation", allow_abbrev=False)
 
     p.add_argument("--log_console", nargs="?", const=True, default=True, type=str2bool)
-    p.add_argument("--comparisons", type=str, required=True, help="Pickle file with comparisons dataframe.")
-    p.add_argument("--dataset", type=str, required=True, help="Images root directory (e.g., images/).")
-    p.add_argument("--checkpoint", type=str, required=True, help="Checkpoint path or filename under --model_dir.")
+    p.add_argument("--comparisons", type=str, default=None, help="Pickle file with comparisons dataframe. Defaults to the training run value when available.")
+    p.add_argument("--dataset", type=str, default=None, help="Images root directory. Defaults to the training run value when available.")
+    p.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path. Defaults to the selected run's best checkpoint.")
+    p.add_argument("--checkpoint_kind", type=str, default="best", choices=["best", "last"], help="Which checkpoint to auto-select from the run folder.")
+    p.add_argument("--run_id", "--wandb_run_id", dest="run_id", type=str, default=None, help="Run id matching models/<run_id>. If omitted, the newest run folder is used.")
 
     p.add_argument("--wandb_config", type=str, default=None, help="Path to wandb run files/config.json.")
-    p.add_argument("--wandb_run_id", type=str, default=None, help="W&B run id (e.g., bz6cgldz) to auto-load config locally.")
     p.add_argument("--wandb_dir", type=str, default="wandb", help="Local W&B directory (default: wandb/).")
 
     p.add_argument("--cuda", nargs="?", const=True, default=False, type=str2bool, help="Enable CUDA if available.")
@@ -517,6 +700,7 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=4, help="DataLoader workers.")
 
     p.add_argument("--cities", type=str, default="all", help='all or comma-separated dataset values (e.g., "berlin,paris").')
+    p.add_argument("--eyetracker_filter", type=str, default="all", choices=["all", "only"], help="Match train.py eyetracker filtering.")
     
     p.add_argument("--ties", nargs="?", const=True, default=False, type=str2bool, help="Enable ties (3-class).")
     p.add_argument(
@@ -550,7 +734,7 @@ def parse_args():
     p.add_argument("--notes", type=str, default="", help="Prefix for outputs/saved/* filename.")
     p.add_argument("--seed", type=int, default=7, help="Random seed.")
     
-    #p.add_argument("--gaze_map_size", default="auto", help="Gaze folder size: 'auto' or integer (e.g., 14, 16).")
+    p.add_argument("--gaze_map_size", default="auto", help="Gaze folder size: 'auto' or integer (e.g., 14, 16).")
 
 
     p.add_argument("--cnn_pool",type=str,default="flatten",choices=["gap", "flatten"],help="CNN feature pooling: gap (global average pool) or flatten (flatten spatial grid).",)
@@ -581,16 +765,29 @@ def parse_args():
     p.add_argument(
         "--attention_mode",
         type=str,
-        default="last",
-        choices=["last", "rollout", "topk"],
+        default="raw",
+        choices=["raw", "last", "rollout", "topk"],
         help="Attention map extraction mode (must match training when using gaze loss).",
     )
+    p.add_argument("--attn_layer", type=int, default=-1, help="Transformer block index used when --attention_mode=raw.")
     p.add_argument(
         "--attn_topk",
         type=int,
         default=None,
         help="Top-k patches for attention_mode=topk (must match training).",
     )
+
+    p.add_argument("--guidance_drop_prob", type=float, default=0.0)
+    p.add_argument("--guidance_strength", type=float, default=1.0)
+    p.add_argument("--guidance_bottleneck_dim", type=int, default=20)
+    p.add_argument("--guidance_gaze_hidden_dim", type=int, default=30)
+    p.add_argument("--guidance_conv_hidden_channels", type=int, default=64)
+    p.add_argument("--guide_train_only", nargs="?", const=True, default=True, type=str2bool)
+    p.add_argument("--egvit_mask_type", type=str, default="separated", choices=["separated", "focused"])
+    p.add_argument("--egvit_keep_ratio", type=float, default=0.25)
+    p.add_argument("--egvit_focus_hw", type=int, nargs=2, default=(7, 7))
+    p.add_argument("--egvit_drop_prob", type=float, default=0.0)
+    p.add_argument("--egvit_train_only", nargs="?", const=True, default=True, type=str2bool)
     
     return p
 
@@ -615,13 +812,21 @@ def _resolve_config_source(args) -> Tuple[str, Dict[str, Any]]:
             _apply_wandb_config_to_args(args, cfg)
             return "wandb_run_id:config.json", source_details
 
+        if run_files["config_yaml"]:
+            try:
+                cfg = _load_wandb_config_yaml(run_files["config_yaml"])
+                _apply_wandb_config_to_args(args, cfg)
+                return "wandb_run_id:config.yaml", source_details
+            except RuntimeError as exc:
+                source_details["config_yaml_error"] = str(exc)
+
         if run_files["metadata_json"]:
             train_cli_args = _load_metadata_args_list(run_files["metadata_json"])
             _apply_train_cli_args_to_test_args(args, train_cli_args)
             return "wandb_run_id:wandb-metadata.json(args)", source_details
 
         raise FileNotFoundError(
-            f"Found run dir '{run_files['run_dir']}' but neither config.json nor wandb-metadata.json exists in files/."
+            f"Found run dir '{run_files['run_dir']}' but no config.json, config.yaml, or wandb-metadata.json exists in files/."
         )
 
     return "manual_cli", source_details
@@ -642,9 +847,32 @@ def main():
     # (STEP 1) ARGUMENT PARSING & CONFIG RESOLUTION
     # =============================================================================================== #
     args = parse_args().parse_args()
+    cli_overrides = set()
+    for token in sys.argv[1:]:
+        if token.startswith("--"):
+            name = token.split("=", 1)[0].lstrip("-").replace("-", "_")
+            if name == "wandb_run_id":
+                name = "run_id"
+            cli_overrides.add(name)
+    args._cli_overrides = cli_overrides
+    args.wandb_run_id = args.run_id
+
+    run_details = _resolve_run_and_checkpoint(args)
 
     # Determine whether config comes from CLI, W&B, or summary JSON
     config_source, config_details = _resolve_config_source(args)
+    config_details = {**run_details, **config_details}
+
+    if args.comparisons is None:
+        raise ValueError(
+            "No comparisons file configured. Pass --comparisons or keep local W&B metadata "
+            "for the selected run so test.py can recover the training value."
+        )
+    if args.dataset is None:
+        raise ValueError(
+            "No dataset root configured. Pass --dataset or keep local W&B metadata "
+            "for the selected run so test.py can recover the training value."
+        )
 
     # Ensure tie margin is always defined
     if args.ranking_margin_ties is None:
@@ -768,63 +996,10 @@ def main():
     # =============================================================================================== #
     # (STEP 7) DATASET & DATALOADER CONSTRUCTION  (mirrors train.py)
     # =============================================================================================== #
-    
-    CNN_BACKBONES = {"alex", "vgg", "dense", "resnet"}
-    is_cnn_backbone = str(args.backbone).lower().strip() in CNN_BACKBONES
-    
-    # Fixed preprocessing for CNNs (same as train.py)
-    SPECS = {
-        "input_size": (3, 224, 224),
-        "crop_pct": 0.875,
-        "mean": (0.485, 0.456, 0.406),
-        "std": (0.229, 0.224, 0.225),
-        "interpolation": "bilinear",
-    }
-    
-    # 1) Resolve model specs + infer token grid (for gaze alignment)
-    if is_cnn_backbone:
-        model_specs = {
-            "alias": args.backbone,
-            "timm_id": None,
-            **SPECS,
-            "img_size": int(SPECS["input_size"][-1]),
-        }
-        grid_h, grid_w = 14, 14
-    else:
-        # No need to download weights just to get patch grid; pretrained=False is enough for grid inference
-        backbone_tmp, model_specs = resolve_backbone(args.backbone, pretrained=False, strict=True)
-        grid_h, grid_w = infer_vit_grid_size(backbone_tmp, model_specs)
-        del backbone_tmp
-    
-    # Optional override to match existing gaze folder layout
-    if str(getattr(args, "gaze_map_size", "auto")).lower() != "auto":
-        forced = int(args.gaze_map_size)
-        grid_h, grid_w = forced, forced
-    
-    args.gaze_grid_size = (int(grid_h), int(grid_w))
-    
-    out_size = int(model_specs.get("img_size", model_specs["input_size"][-1]))
-    
-    gaze_cfg = build_gaze_config(args, is_cnn_backbone=is_cnn_backbone, out_size=out_size)
-    args.gaze_cfg = gaze_cfg
-
-    # Optional override to match existing gaze folder layout (kept as-is)
-    if str(getattr(args, "gaze_map_size", "auto")).lower() != "auto":
-        forced = int(args.gaze_map_size)
-        args.gaze_grid_size = (forced, forced)
-    
-    # map_size selector used by dataset folder resolution
-    args.gaze_map_size_int = int(out_size) if str(gaze_cfg.gaze_output) == "guide" else int(args.gaze_grid_size[0])
-    
-    enable_gaze = bool(gaze_cfg.load_gaze)
-    gaze_output = str(gaze_cfg.gaze_output)
-    
-    eval_tfms, eval_meta = build_eval_transforms(
-        model_specs,
-        gaze_grid_size=args.gaze_grid_size,
-        enable_gaze=enable_gaze,
-        gaze_output=gaze_output,
+    backbone_model, model_specs, _train_tfms, eval_tfms, _use_gaze_requested, use_gaze_loss, is_cnn_backbone = (
+        _build_transforms_and_specs(args)
     )
+    enable_gaze = bool(getattr(args.gaze_cfg, "load_gaze", False))
     
     dataset = ComparisonsDataset(
         dataframe=df,
@@ -851,13 +1026,15 @@ def main():
     print("CHECKPOINT LOADING")
     print(_hr("-"))
 
-    net = build_model(args).to(device)
-
-    ckpt_path = (
-        args.checkpoint
-        if os.path.isabs(args.checkpoint)
-        else os.path.join(args.model_dir, args.checkpoint)
+    net = build_train_model(
+        args=args,
+        backbone_model=backbone_model,
+        use_gaze_loss=use_gaze_loss,
+        is_cnn_backbone=is_cnn_backbone,
     )
+    net.to(device)
+
+    ckpt_path = args.checkpoint
 
     ckpt_report = _load_checkpoint(net, ckpt_path, device)
     _print_kv("Checkpoint report:", ckpt_report)

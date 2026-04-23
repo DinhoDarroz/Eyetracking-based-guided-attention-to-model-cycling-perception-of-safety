@@ -252,27 +252,43 @@ def apply_backbone_hparam_overrides(args) -> None:
     Override selected hyperparameters based on backbone.
 
     Current policy:
-      - dinov3_vitb16            -> num_ft_blocks=4, ranking_margin=2.0
-      - deit3_base_patch16_224   -> num_ft_blocks=4, ranking_margin=2.0
-      - vit_base_patch16_224     -> num_ft_blocks=8, ranking_margin=3.2
+      - dinov3_vitb16:
+          num_ft_blocks=4, ranking_margin=2.0,
+          attn_w(raw)=1.5, attn_w(rollout)=0.01
+      - deit3_base_patch16_224:
+          num_ft_blocks=4, ranking_margin=2.0,
+          attn_w(raw)=0.75, attn_w(rollout)=0.01
+      - vit_base_patch16_224:
+          num_ft_blocks=8, ranking_margin=3.2,
+          attn_w(raw)=2.0, attn_w(rollout)=0.25
 
     Only modifies attributes when the backbone is explicitly listed here.
     Also keeps ranking_margin_ties aligned when it was not explicitly set.
+    Attention mode aliases:
+      - "last", "cls", "topk" are treated as "raw" for attn_w override.
     """
     backbone = str(getattr(args, "backbone", "")).strip().lower()
+    attn_mode = str(getattr(args, "attention_mode", "raw")).strip().lower()
+    if attn_mode in ("last", "cls", "topk"):
+        attn_mode = "raw"
+    if attn_mode not in ("raw", "rollout"):
+        attn_mode = "raw"
 
     overrides = {
         "dinov3_vitb16": {
             "num_ft_blocks": 4,
             "ranking_margin": 2.0,
+            "attn_w": {"raw": 1.5, "rollout": 0.01},
         },
         "deit3_base_patch16_224": {
             "num_ft_blocks": 4,
             "ranking_margin": 2.0,
+            "attn_w": {"raw": 0.75, "rollout": 0.01},
         },
         "vit_base_patch16_224": {
             "num_ft_blocks": 8,
             "ranking_margin": 3.2,
+            "attn_w": {"raw": 2.0, "rollout": 0.25},
         },
     }
 
@@ -283,9 +299,11 @@ def apply_backbone_hparam_overrides(args) -> None:
     old_num_ft_blocks = getattr(args, "num_ft_blocks", None)
     old_ranking_margin = getattr(args, "ranking_margin", None)
     old_ranking_margin_ties = getattr(args, "ranking_margin_ties", None)
+    old_attn_w = getattr(args, "attn_w", None)
 
     args.num_ft_blocks = int(cfg["num_ft_blocks"])
     args.ranking_margin = float(cfg["ranking_margin"])
+    args.attn_w = float(cfg["attn_w"][attn_mode])
 
     # Keep ties margin synchronized when it was not explicitly set.
     if old_ranking_margin_ties is None:
@@ -300,6 +318,9 @@ def apply_backbone_hparam_overrides(args) -> None:
         "new_ranking_margin": args.ranking_margin,
         "old_ranking_margin_ties": old_ranking_margin_ties,
         "new_ranking_margin_ties": getattr(args, "ranking_margin_ties", None),
+        "attention_mode": attn_mode,
+        "old_attn_w": old_attn_w,
+        "new_attn_w": getattr(args, "attn_w", None),
     }
     
 def _boolish_series_to_bool_mask(s: pd.Series) -> pd.Series:
@@ -1044,4 +1065,3 @@ def scale_lr_and_eta_min_by_unfrozen_blocks(
         new_eta = float(eta_other)
 
     return new_lr, new_eta
-
