@@ -1,0 +1,20 @@
+EG-PCS Dataset License Notice
+
+Recommended licensing before public deposit:
+
+1. Pairwise labels, metadata, and derived gaze maps:
+   Creative Commons Attribution 4.0 International (CC BY 4.0), if permitted by
+   participant consent and institutional/ethics approvals.
+
+2. Code:
+   Use the repository's code license.
+
+3. Street-view images:
+   Use only the license or redistribution terms allowed by the original image
+   provider. If redistribution is not permitted, do not include image files in
+   the public archive. Release image identifiers, URLs, metadata, and a
+   reconstruction script instead.
+
+Before assigning a final license to the public dataset DOI, confirm image rights
+and human-subject data release permissions.
+

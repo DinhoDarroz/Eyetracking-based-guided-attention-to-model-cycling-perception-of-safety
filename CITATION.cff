@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use EG-PCS, please cite both the paper and the dataset DOI."
+title: "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset"
+version: "1.0.0"
+doi: "10.5281/zenodo.20101496"
+date-released: "2026-05-09"
+authors:
+  - family-names: "Perdigao"
+    given-names: "Luis Maria"
+  - family-names: "Costa"
+    given-names: "Miguel"
+  - family-names: "Santiago"
+    given-names: "Carlos"
+  - family-names: "Marques"
+    given-names: "Manuel"
+repository-code: "https://github.com/DinhoDarroz/Eyetracking-based-guided-attention-to-model-cycling-perception-of-safety"
+abstract: "Pairwise perceived cycling safety comparisons, street-view images, and fixation-based gaze maps for eye-tracking-guided perceived cycling safety prediction."
+keywords:
+  - perceived cycling safety
+  - eye tracking
+  - gaze maps
+  - pairwise comparison
+  - street-view imagery
+  - computer vision
+license: "CC-BY-4.0"

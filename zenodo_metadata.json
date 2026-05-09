@@ -1,0 +1,43 @@
+{
+  "metadata": {
+    "title": "EG-PCS: Eye-Tracking-Guided Perceived Cycling Safety Dataset",
+    "upload_type": "dataset",
+    "description": "The EG-PCS dataset accompanies the accepted paper at the 2026 IEEE 29th International Conference on Intelligent Transportation Systems (ITSC). It contains pairwise perceived cycling safety comparisons, street-view image pairs, and fixation-based gaze maps derived from eye-tracking experiments. It supports research on perceived cycling safety prediction, gaze-guided computer vision, attention alignment, and human visual attention in urban imagery.",
+    "creators": [
+      {
+        "name": "Perdigao, Luis Maria"
+      },
+      {
+        "name": "Costa, Miguel"
+      },
+      {
+        "name": "Santiago, Carlos"
+      },
+      {
+        "name": "Marques, Manuel"
+      }
+    ],
+    "access_right": "open",
+    "license": "cc-by-4.0",
+    "version": "1.0.0",
+    "publication_date": "2026-05-09",
+    "keywords": [
+      "perceived cycling safety",
+      "eye tracking",
+      "gaze maps",
+      "pairwise comparison",
+      "street-view imagery",
+      "computer vision",
+      "attention alignment"
+    ],
+    "related_identifiers": [
+      {
+        "identifier": "https://github.com/DinhoDarroz/Eyetracking-based-guided-attention-to-model-cycling-perception-of-safety",
+        "relation": "isSupplementedBy",
+        "scheme": "url",
+        "resource_type": "software"
+      }
+    ],
+    "prereserve_doi": true
+  }
+}

@@ -35,6 +35,7 @@ pickle_files/
 images/
 Eyetracker_attention_maps/
 **/Eyetracker_attention_maps/
+EG-PCS-Dataset-v*/
 *.npy
 *.npz
 *.pkl
