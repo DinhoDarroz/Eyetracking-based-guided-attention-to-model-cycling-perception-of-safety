@@ -1096,16 +1096,7 @@ def _make_validation_handler(
                 raise optuna.TrialPruned()
 
         # ---------------------------------------------------------------------
-        # 5) Optional detailed breakdown for classification-capable models
-        # ---------------------------------------------------------------------
-        epoch_idx = engine.state.epoch
-        if args.model in ["sscnn", "rsscnn"]:
-            # Computes extra diagnostic breakdowns (e.g., per-class accuracy) for the
-            # classification output branch; used for interpretability/debugging.
-            _compute_class_breakdown(args, net, val_loader, device, "Validation", epoch_idx)
-
-        # ---------------------------------------------------------------------
-        # 6) Optional model-specific evaluation behavior
+        # 5) Optional model-specific evaluation behavior
         # ---------------------------------------------------------------------
         # Some backbones/wrappers expose a partial_eval method to evaluate in a
         # reduced or specialized mode (e.g., freezing stochastic components).
@@ -1116,7 +1107,7 @@ def _make_validation_handler(
         net.train()
 
         # ---------------------------------------------------------------------
-        # 7) Assemble a consolidated metrics dictionary for logging
+        # 6) Assemble a consolidated metrics dictionary for logging
         # ---------------------------------------------------------------------
         metrics = {
             "accuracy_train": engine.state.metrics.get("acc"),

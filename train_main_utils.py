@@ -63,49 +63,28 @@ def initialize_wandb(args):
         if getattr(args, "resume_checkpoint", None)
         else None
     )
-
-    wandb.init(
-        project=args.wandb_project,
-        config={
-            "early_stop": getattr(args, "early_stop", False),
-            "early_stop_metric": getattr(args, "early_stop_metric", "accuracy_validation"),
-            "early_stop_mode": getattr(args, "early_stop_mode", "max"),
-            "early_stop_patience": getattr(args, "early_stop_patience", 3),
-            "early_stop_min_delta": getattr(args, "early_stop_min_delta", 0.0),
-            "early_stop_start_epoch": getattr(args, "early_stop_start_epoch", 1),
-            "dataset": args.comparisons,
-            "ties": args.ties,
-            "ties_w": args.ties_w,
-            "rank_w": args.rank_w,
-            "rank_margin": args.ranking_margin,
-            "rank_margin_ties": args.ranking_margin_ties,
-            "seed": args.seed,
-            "epochs": args.max_epochs,
-            "batch_size": args.batch_size,
+    args_config = dict(vars(args))
+    args_config.update(
+        {
+            # Keep the old names for compatibility with existing dashboards, but
+            # also log the raw CLI names so recovery sweeps are easy to group.
             "architecture_backbone": args.backbone,
             "architecture_model": args.model,
             "finetune_backbone": args.finetune,
-            "num_ft_blocks": getattr(args, "num_ft_blocks", None),
-            "base_lr": args.base_lr,
-            "weight_decay": args.weight_decay,
-            #"backbone_lr_scale": getattr(args, "backbone_lr_scale", None),
-            "scheduler": args.scheduler,
-            "warmup_frac": getattr(args, "warmup_frac", None),
-            "eta_min": getattr(args, "eta_min", None),
-            "T_0": getattr(args, "T_0", None),
-            "T_mult": getattr(args, "T_mult", None),
-            "rank_dropout": getattr(args, "rank_dropout", None),
-            "cross_dropout": getattr(args, "cross_dropout", None),
-            "label_smoothing": getattr(args, "label_smoothing", None),
-            "use_class_weights": getattr(args, "use_class_weights", None),
-            "augment": args.augment,
-            "resume": args.resume,
+            "epochs": args.max_epochs,
+            "dataset": args.comparisons,
+            "rank_margin": args.ranking_margin,
+            "rank_margin_ties": args.ranking_margin_ties,
             "resume_epoch": args.epoch,
             "checkpoint": checkpoint_path,
             "gaze_mode": str(getattr(args, "gaze_mode", "disable")),
             "use_nobp": bool(getattr(args, "use_nobp", False)),
+        }
+    )
 
-        },
+    wandb.init(
+        project=args.wandb_project,
+        config=args_config,
     )
 
     wandb.define_metric("iteration")

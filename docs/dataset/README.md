@@ -1,25 +1,18 @@
 # EG-PCS Dataset
 
-The EG-PCS dataset is released through Zenodo:
+The **EG-PCS dataset** is a research collection for perceived cycling safety. It contains pairwise street-view image comparisons, perceived-safety labels, and fixation-based gaze maps collected from eye-tracking experiments.
 
-https://doi.org/10.5281/zenodo.20101496
+Dataset DOI: https://doi.org/10.5281/zenodo.20101496
 
-This folder contains the small, GitHub-friendly dataset documentation and
-release metadata. The large dataset archive itself is stored on Zenodo, not in
-this repository.
+## Contents
 
-## Files
+- Pairwise comparison labels for street-view image pairs.
+- Street-view image references used in the comparisons.
+- Derived gaze maps representing participant visual attention during the task.
+- Column-level documentation in `data_dictionary.csv`.
+- Dataset card in `dataset_card.md`.
+- License notice in `DATA_LICENSE.txt`.
 
-- `dataset_card.md`: scientific dataset card.
-- `data_dictionary.csv`: column-level documentation.
-- `release_guide.md`: release structure and validation notes.
-- `zenodo_upload.md`: upload and DOI workflow.
-- `zenodo_metadata.json`: Zenodo record metadata.
-- `zenodo_archive.sha256`: checksum of the archive uploaded to Zenodo.
-- `DATA_LICENSE.txt`: component-level license notice.
+## Research Use
 
-## Public Archive
-
-The Zenodo archive contains the comparison tables, street-view images, and gaze
-maps. It intentionally does not include experimental split files.
-
+The dataset supports research on perceived cycling safety, pairwise visual ranking, gaze-guided learning, attention alignment, and interpretable urban analytics.

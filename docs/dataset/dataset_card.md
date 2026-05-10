@@ -1,57 +1,36 @@
 # EG-PCS Dataset Card
 
-## Dataset Summary
+## Summary
 
-EG-PCS contains pairwise perceived cycling safety comparisons, street-view image
-pairs, and fixation-based gaze maps derived from an eye-tracking experiment. It
-supports research on perceived urban safety, pairwise visual ranking, gaze-guided
-learning, and attention alignment.
+EG-PCS contains pairwise perceived cycling safety comparisons, street-view image pairs, and fixation-based gaze maps from an eye-tracking experiment. The dataset supports research on subjective urban safety, pairwise visual ranking, gaze-guided learning, and human-aligned attention models.
 
 ## Data Instances
 
-Each row in `comparisons/comparisons.csv` represents one pairwise comparison
-between a left image and a right image. The row contains the ground-truth
-pairwise label, image references, optional gaze-map references, and anonymized
-survey/trial metadata.
+Each row in the comparison table represents one pairwise judgment between a left street-view image and a right street-view image. Rows include the perceived safety label, image references, optional gaze-map references, and anonymized survey/trial metadata.
 
 ## Labels
 
-The `score` field is the ground-truth pairwise label:
+The `score` field is the pairwise ground-truth label:
 
-- `-1`: left image is perceived as safer.
-- `0`: tie.
-- `+1`: right image is perceived as safer.
+- `-1`: the left image is perceived as safer.
+- `0`: both images are perceived as similarly safe.
+- `+1`: the right image is perceived as safer.
 
 ## Gaze Maps
 
-Gaze maps are stored as NumPy `.npy` arrays and were generated from fixation data
-with `survey_eye_tracker/build_fixation_based_attention_maps_ogama_like.py`.
-They are released as derived attention maps rather than raw participant gaze
-streams.
+Gaze maps are released as NumPy `.npy` arrays derived from fixation data. They represent visual attention during the perceived-safety comparison task and are intended for gaze-guided training, attention-alignment evaluation, and interpretability analysis.
 
 ## Intended Uses
 
 - Pairwise perceived cycling safety prediction.
-- Gaze-guided computer vision and attention-alignment experiments.
-- Human visual attention analysis for urban imagery.
-- Reproducibility of EG-PCS experiments.
+- Gaze-guided computer vision experiments.
+- Attention-alignment and interpretability studies.
+- Urban perception research using street-view imagery.
 
-## Out-of-Scope Uses
+## Limitations
 
-The dataset should not be used to identify individual study participants or to
-make high-stakes decisions about individual people. It should not be interpreted
-as a complete, universal measure of urban safety.
+The labels reflect perceived safety judgments collected in a specific survey setting. They may be influenced by participant demographics, city coverage, image-source coverage, and street-view capture conditions. Gaze maps represent attention during the task and should not be interpreted as complete causal explanations of perceived safety.
 
-## Privacy and Ethics
+## Ethics and Privacy
 
-The public release should include only anonymized survey/trial metadata and
-derived gaze maps. Do not include raw personally identifying eye-tracking records
-unless the relevant consent and ethics approvals explicitly allow it.
-
-## Known Limitations
-
-The labels reflect perceived safety judgments in the survey setting and may be
-affected by participant demographics, image source coverage, city selection, and
-street-view capture conditions. Gaze maps represent visual attention during the
-task, not causal explanations of safety perception.
-
+The public dataset uses anonymized survey/trial metadata and derived gaze maps. It is not intended for identifying individual study participants or for making high-stakes decisions about individual people.
