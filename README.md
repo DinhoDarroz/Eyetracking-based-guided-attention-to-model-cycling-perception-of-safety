@@ -10,7 +10,9 @@ The core idea is simple: a model should not only predict which street scene appe
 
 ## Architecture
 
-![EG-PCS architecture](docs/PCS-Net_arch.png)
+<p align="center">
+  <img src="docs/PCS-Net_arch.png" alt="EG-PCS architecture" width="900">
+</p>
 
 EG-PCS compares two street-view images through shared visual encoders and task-specific branches:
 
@@ -20,7 +22,7 @@ EG-PCS compares two street-view images through shared visual encoders and task-s
 
 ## Dataset
 
-We introduce the **EG-PCS dataset**, a research collection for perceived cycling safety that includes pairwise street-view comparisons, safety labels, and fixation-based gaze maps derived from eye-tracking experiments.
+We introduce the **EG-PCS dataset**, a research collection for perceived cycling safety that includes pairwise street-view comparisons, safety labels, and fixation-based gaze maps derived from eye-tracking experiments. The dataset was formed from 249 survey responses, including 26 surveys collected with eye-tracking technology.
 
 The dataset is available for research use through Zenodo:
 
@@ -85,7 +87,7 @@ Useful options include `--model`, `--backbone`, `--gaze_mode`, `--attn_w`, `--ba
 
 ## How to Cite
 
-If you use this repository or build on EG-PCS, please cite:
+If you use this repository or build on EG-PCS, please cite the paper below. If you use the EG-PCS dataset, citation metadata for the dataset DOI is also available in [CITATION.cff](CITATION.cff).
 
 ```bibtex
 @inproceedings{perdigao2026learning,
