@@ -284,7 +284,8 @@ def _apply_wandb_config_to_args(args, cfg: dict):
         "model": "model",
         "finetune_backbone": "finetune",
         "finetune": "finetune",
-        "num_ft_blocks": "num_ft_blocks",
+        "num_ft_layers": "num_ft_layers",
+        "num_ft_blocks": "num_ft_layers",
         "ties": "ties",
         "gaze_mode": "gaze_mode",
         "eyetracker_filter": "eyetracker_filter",
@@ -452,6 +453,7 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
 
     p.add_argument("--finetune", nargs="?", const=True, type=str2bool)
 
+    p.add_argument("--num_ft_layers", type=int)
     p.add_argument("--num_ft_blocks", type=int)
     p.add_argument("--rank_dropout", type=float)
     p.add_argument("--cross_dropout", type=float)
@@ -521,6 +523,15 @@ def _apply_train_cli_args_to_test_args(args, train_cli_args: List[str]):
     args.gaze_mode = normalize_gaze_mode(raw_s)
     args.gaze = args.gaze_mode
 
+
+def _normalize_finetune_layer_args(args) -> None:
+    new_value = getattr(args, "num_ft_layers", None)
+    legacy_value = getattr(args, "num_ft_blocks", None)
+    if new_value is None:
+        new_value = 1 if legacy_value is None else legacy_value
+    args.num_ft_layers = int(new_value)
+    if hasattr(args, "num_ft_blocks"):
+        delattr(args, "num_ft_blocks")
 
 
 def _load_summary_json(path: str) -> Optional[dict]:
@@ -679,7 +690,7 @@ def build_model(args):
             pool_k=int(getattr(args, "pool_k", 10)),
             num_classes=3 if bool(getattr(args, "ties", False)) else 2,
             finetune=bool(getattr(args, "finetune", False)),
-            num_ft_blocks=int(getattr(args, "num_ft_blocks", 1)),
+            num_ft_layers=int(getattr(args, "num_ft_layers", getattr(args, "num_ft_blocks", 1))),
             rank_dropout=float(getattr(args, "rank_dropout", 0.0) or 0.0),
             cross_dropout=float(getattr(args, "cross_dropout", 0.0) or 0.0),
             use_attn_hook=use_attn_hook,
@@ -807,7 +818,8 @@ def parse_args():
     p.add_argument("--backbone", type=str, default="vit_base_dino", help="Backbone used in training.")
     
     p.add_argument("--finetune", nargs="?", const=True, default=False, type=str2bool, help="If backbone was finetuned.")
-    p.add_argument("--num_ft_blocks", type=int, default=1, help="Transformer blocks unfrozen (if finetune).")
+    p.add_argument("--num_ft_layers", type=int, default=None, help="Last ViT encoder layers unfrozen (if finetune); earlier layers stay frozen.")
+    p.add_argument("--num_ft_blocks", type=int, default=None, help=argparse.SUPPRESS)
     
     p.add_argument("--rank_dropout", type=float, default=0.3, help="Ranking head dropout (Transformer).")
     p.add_argument("--cross_dropout", type=float, default=0.3, help="Classification head dropout (Transformer).")
@@ -951,6 +963,7 @@ def main():
 
     # Determine whether config comes from CLI, W&B, or summary JSON
     config_source, config_details = _resolve_config_source(args)
+    _normalize_finetune_layer_args(args)
     config_details = {**run_details, **config_details}
 
     if args.comparisons is None:
@@ -1035,7 +1048,7 @@ def main():
         "model_head": args.model,
         "backbone": args.backbone,
         "finetune": _fmt_bool(args.finetune),
-        "num_ft_blocks": args.num_ft_blocks,
+        "num_ft_layers": args.num_ft_layers,
         "rank_dropout": args.rank_dropout,
         "cross_dropout": args.cross_dropout,
         "use_seg": _fmt_bool(args.use_seg),

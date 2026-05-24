@@ -41,7 +41,8 @@ from train_main_utils import (
     _maybe_wrap_dataparallel,
     _maybe_resume,
     _cleanup_between_trials,
-    scale_lr_and_eta_min_by_unfrozen_blocks,
+    normalize_finetune_layer_args,
+    scale_lr_and_eta_min_by_unfrozen_layers,
 )
 
 from scripts.train_script import train
@@ -159,10 +160,11 @@ def arg_parse():
             "  disable    : no gaze loading, no KL diagnostics, no injection, no attention hooks\n"
             "  diag       : KL computed for diagnostics only (no gradient contribution)\n"
             "  guide      : gaze injected; KL computed for diagnostics only\n"
-            "  egvit     : EG-ViT masking (mask patch tokens by gaze during training; no KL)\n"
+            "  egvit      : EG-ViT masking (mask patch tokens by gaze during training; no KL)\n"
+            "  gaze_bias  : gaze prior injected into self-attention logits during training; no KL by default\n"
             "  align      : KL added to total loss (attn_w * KL)\n"
             "  align+gaze : gaze injected and KL added to total loss (attn_w * KL)\n"
-            "Legacy aliases: off->diag, align+guide->align+gaze\n"
+            "Legacy aliases: off->diag, align+guide->align+gaze, attn_bias->gaze_bias\n"
         ),
     )
 
@@ -194,6 +196,45 @@ def arg_parse():
             ">=0 selects 0-based block index; "
             "<=-2 selects relative to the end (e.g., -2 is penultimate)."
         ),
+    )
+
+    parser.add_argument(
+        "--gaze_align_target",
+        type=str,
+        default="attention",
+        choices=["attention", "patch_tokens"],
+        help=(
+            "Spatial signal used for gaze KL alignment. "
+            "attention aligns CLS-to-patch attention; patch_tokens aligns a patch-token importance map, "
+            "which is better coupled to patch_mean/GAP pooling."
+        ),
+    )
+
+
+    parser.add_argument(
+        "--gaze_attention_bias",
+        type=str,
+        default="none",
+        choices=["none", "cls_to_patch", "all_queries_to_patch"],
+        help=(
+            "Variant used by --gaze_mode gaze_bias. "
+            "cls_to_patch biases the CLS query toward gaze patches; all_queries_to_patch also biases patch-token updates, "
+            "which is more suitable for patch_mean/GAP pooling. If left as none under gaze_bias, all_queries_to_patch is used."
+        ),
+    )
+    parser.add_argument(
+        "--gaze_attention_bias_strength",
+        type=float,
+        default=0.5,
+        help="Strength of the gaze log-prior added to attention logits for --gaze_mode gaze_bias. Try 0.25-1.0 first.",
+    )
+    parser.add_argument(
+        "--gaze_attention_bias_train_only",
+        nargs="?",
+        const=True,
+        default=True,
+        type=str2bool,
+        help="If True, gaze-biased attention is used only during training; validation/test remain gaze-free.",
     )
 
 
@@ -322,7 +363,8 @@ def arg_parse():
 
     # -------------------- MISC -------------------------------
     parser.add_argument("--seed", type=int, default=5)
-    parser.add_argument("--num_ft_blocks", type=int, default=1, help="Number of last transformer blocks to unfreeze when --finetune is set.")
+    parser.add_argument("--num_ft_layers", type=int, default=None, help="Number of last ViT encoder layers to unfreeze when --finetune is set; earlier encoder layers stay frozen.")
+    parser.add_argument("--num_ft_blocks", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--cnn_pool",
         type=str,
@@ -357,12 +399,13 @@ def run_training_with_args(args, trial=None):
     # ==============================================================================================
     # 0) ARG VALIDATION / NORMALIZATION
     # ==============================================================================================
+    normalize_finetune_layer_args(args)
     validate_and_normalize_args(args, strict=False, verbose=True)
-    #args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_blocks(args, lr_01=3e-4, lr_other=2e-5)
+    #args.base_lr, args.eta_min = scale_lr_and_eta_min_by_unfrozen_layers(args, lr_01=3e-4, lr_other=2e-5)
     apply_backbone_hparam_overrides(args)
     print(
     f"[DEBUG backbone overrides] backbone={args.backbone} "
-    f"num_ft_blocks={args.num_ft_blocks} "
+    f"num_ft_layers={args.num_ft_layers} "
     f"ranking_margin={args.ranking_margin} "
     f"ranking_margin_ties={args.ranking_margin_ties}"
     )

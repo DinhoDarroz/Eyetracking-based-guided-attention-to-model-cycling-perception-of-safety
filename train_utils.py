@@ -200,7 +200,7 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     if (model != "multitask_gaze") and wants_kl:
         _warn(warnings, f"--gaze_mode={gaze_mode} requests KL diagnostics/supervision, but --model={model}; KL will be disabled.")
 
-    if gaze_mode in ("disable", "diag", "guide") and attn_w > 0.0:
+    if gaze_mode in ("disable", "diag", "guide", "gaze_bias") and attn_w > 0.0:
         _warn(warnings, f"--attn_w={attn_w} but --gaze_mode={gaze_mode}; KL will not contribute to the objective (w_kl_eff=0).")
 
     if gaze_mode in ("align", "align+gaze") and attn_w == 0.0:
@@ -210,18 +210,17 @@ def validate_and_normalize_args(args, strict: bool = False, verbose: bool = True
     # ------------------------------------------------------------------
     # Finetuning dependencies
     # ------------------------------------------------------------------
+    n_layers = int(getattr(args, "num_ft_layers", getattr(args, "num_ft_blocks", 1)))
     if not getattr(args, "finetune", False):
-        # num_ft_blocks won’t matter if backbone is frozen
-        if getattr(args, "num_ft_blocks", 1) != 1:
-            _warn(warnings, "--finetune is OFF: --num_ft_blocks is ignored.")
+        # num_ft_layers will not matter if backbone is frozen.
+        if n_layers != 1:
+            _warn(warnings, "--finetune is OFF: --num_ft_layers is ignored.")
     else:
         # Finetune is ON
-        n_blocks = getattr(args, "num_ft_blocks", 1)
-        
-        if n_blocks == 0:
-            _warn(warnings, "[WARNING] --finetune is ON but --num_ft_blocks=0. The backbone will remain FROZEN (only head trains).")
-        elif n_blocks < 0:
-            _err(errors, f"--num_ft_blocks must be >= 0 (got {n_blocks}).")
+        if n_layers == 0:
+            _warn(warnings, "[WARNING] --finetune is ON but --num_ft_layers=0. The backbone will remain FROZEN (only head trains).")
+        elif n_layers < 0:
+            _err(errors, f"--num_ft_layers must be >= 0 (got {n_layers}).")
 
     # ------------------------------------------------------------------
     # Pooling dependencies (New)
@@ -543,29 +542,29 @@ def _count_params(model: nn.Module) -> Tuple[int, int]:
     return total, trainable
 
 
-def _infer_vit_blocks(model: nn.Module) -> Optional[Tuple[int, List[int]]]:
+def _infer_vit_layers(model: nn.Module) -> Optional[Tuple[int, List[int]]]:
     """
-    Infer ViT block structure and which blocks are trainable.
+    Infer ViT encoder layer structure and which layers are trainable.
     """
     backbone = getattr(model, "backbone", None)
     if backbone is None:
         return None
 
-    blocks = getattr(backbone, "blocks", None)
-    if blocks is None:
+    layers = getattr(backbone, "blocks", None)
+    if layers is None:
         return None
 
     try:
-        n_blocks = len(blocks)
+        n_layers = len(layers)
     except Exception:
         return None
 
     trainable = []
-    for i, blk in enumerate(blocks):
-        if any(p.requires_grad for p in blk.parameters()):
+    for i, layer in enumerate(layers):
+        if any(p.requires_grad for p in layer.parameters()):
             trainable.append(i)
 
-    return n_blocks, trainable
+    return n_layers, trainable
 
 
 def _summarize_optimizer(optimizer: torch.optim.Optimizer) -> List[str]:
@@ -631,16 +630,20 @@ def print_run_plan(
         print(f"  inject_gaze  : {bool(getattr(gaze_cfg, 'inject', False))}")
         print(f"  compute_kl   : {bool(getattr(gaze_cfg, 'compute_kl', False))}")
         print(f"  kl_in_loss   : {bool(getattr(gaze_cfg, 'use_kl_in_loss', False))}")
+        print(f"  align_target : {getattr(gaze_cfg, 'align_target', getattr(args, 'gaze_align_target', 'attention'))}")
+        if bool(getattr(gaze_cfg, 'attention_bias', False)):
+            print(f"  attn_bias   : {getattr(args, 'gaze_attention_bias', 'none')} (strength={float(getattr(args, 'gaze_attention_bias_strength', 0.0))})")
 
     if bool(getattr(gaze_cfg, 'need_attn_maps', False)):
         print(f"  attn_mode    : {getattr(args, 'attention_mode', 'raw')}")
 
     print(f"  augment      : {args.augment}")
-    finetune_on = bool(getattr(args, "finetune", False)) and int(getattr(args, "num_ft_blocks", 0)) > 0
+    n_ft_layers = int(getattr(args, "num_ft_layers", getattr(args, "num_ft_blocks", 0)))
+    finetune_on = bool(getattr(args, "finetune", False)) and n_ft_layers > 0
     
     print(f"  finetune     : {finetune_on}")
     if finetune_on:
-        print(f"  num_ft_blocks: {args.num_ft_blocks}")
+        print(f"  num_ft_layers: {n_ft_layers}")
 
 
     # ---------------------------------------------------------------------------------------------
@@ -732,12 +735,12 @@ def print_run_plan(
         total, trainable = _count_params(model)
         print(f"  parameters  : total={total:,}, trainable={trainable:,}")
 
-        vit_info = _infer_vit_blocks(model)
+        vit_info = _infer_vit_layers(model)
         if vit_info is not None:
-            n_blocks, trainable_blocks = vit_info
-            print(f"  vit blocks  : {n_blocks}")
-            if trainable_blocks:
-                print(f"  unfrozen    : {trainable_blocks}")
+            n_layers, trainable_layers = vit_info
+            print(f"  vit layers  : {n_layers}")
+            if trainable_layers:
+                print(f"  unfrozen    : {trainable_layers}")
             else:
                 print("  unfrozen    : none (backbone frozen)")
 
@@ -765,15 +768,15 @@ def print_run_plan(
             if partial_max_blocks is not None:
                 print(f"  partial_max_blocks: {partial_max_blocks}")
     
-            n_trainable_blocks = optimizer_info.get("n_trainable_blocks")
-            trainable_block_idxs = optimizer_info.get("trainable_block_idxs")
-            if n_trainable_blocks is not None:
-                print(f"  trainable_vit_blocks: {n_trainable_blocks}")
-            if trainable_block_idxs is not None:
-                show = trainable_block_idxs
+            n_trainable_layers = optimizer_info.get("n_trainable_layers", optimizer_info.get("n_trainable_blocks"))
+            trainable_layer_idxs = optimizer_info.get("trainable_layer_idxs", optimizer_info.get("trainable_block_idxs"))
+            if n_trainable_layers is not None:
+                print(f"  trainable_vit_layers: {n_trainable_layers}")
+            if trainable_layer_idxs is not None:
+                show = trainable_layer_idxs
                 if isinstance(show, (list, tuple)) and len(show) > 20:
                     show = list(show[:20]) + ["..."]
-                print(f"  vit_block_idxs: {show}")
+                print(f"  vit_layer_idxs: {show}")
     
             fallback = optimizer_info.get("fallback")
             if fallback:

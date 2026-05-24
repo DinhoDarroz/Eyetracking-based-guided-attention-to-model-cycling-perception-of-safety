@@ -227,21 +227,22 @@ def apply_backbone_hparam_overrides(args) -> None:
 
     Current policy:
       - dinov3_vitb16:
-          num_ft_blocks=4, ranking_margin=2.0,
-          attn_w(raw)=1.5, attn_w(rollout)=0.01
+          num_ft_layers=4, ranking_margin=2.0
+          # attn_w(raw)=1.5, attn_w(rollout)=0.01  <-- Commented out for retuning
       - deit3_base_patch16_224:
-          num_ft_blocks=4, ranking_margin=2.0,
-          attn_w(raw)=0.75, attn_w(rollout)=0.01
+          num_ft_layers=4, ranking_margin=2.0
+          # attn_w(raw)=0.75, attn_w(rollout)=0.01 <-- Commented out for retuning
       - vit_base_patch16_224:
-          num_ft_blocks=8, ranking_margin=3.2,
-          attn_w(raw)=2.0, attn_w(rollout)=0.25
+          num_ft_layers=8, ranking_margin=3.2
+          # attn_w(raw)=2.0, attn_w(rollout)=0.25  <-- Commented out for retuning
 
     Only modifies attributes when the backbone is explicitly listed here.
     Also keeps ranking_margin_ties aligned when it was not explicitly set.
-    Attention mode aliases:
-      - "last" and "cls" are treated as "raw" for attn_w override.
     """
     backbone = str(getattr(args, "backbone", "")).strip().lower()
+    
+    # Keeping the attn_mode parsing just in case you need it later, 
+    # but the override below is disabled.
     attn_mode = str(getattr(args, "attention_mode", "raw")).strip().lower()
     if attn_mode in ("last", "cls"):
         attn_mode = "raw"
@@ -250,19 +251,19 @@ def apply_backbone_hparam_overrides(args) -> None:
 
     overrides = {
         "dinov3_vitb16": {
-            "num_ft_blocks": 4,
+            "num_ft_layers": 4,
             "ranking_margin": 2.0,
-            "attn_w": {"raw": 1.5, "rollout": 0.01},
+            # "attn_w": {"raw": 1.5, "rollout": 0.01},
         },
         "deit3_base_patch16_224": {
-            "num_ft_blocks": 4,
+            "num_ft_layers": 4,
             "ranking_margin": 2.0,
-            "attn_w": {"raw": 0.75, "rollout": 0.01},
+            # "attn_w": {"raw": 0.75, "rollout": 0.01},
         },
         "vit_base_patch16_224": {
-            "num_ft_blocks": 8,
+            "num_ft_layers": 8,
             "ranking_margin": 3.2,
-            "attn_w": {"raw": 2.0, "rollout": 0.25},
+            # "attn_w": {"raw": 2.0, "rollout": 0.25},
         },
     }
 
@@ -270,14 +271,14 @@ def apply_backbone_hparam_overrides(args) -> None:
     if cfg is None:
         return
 
-    old_num_ft_blocks = getattr(args, "num_ft_blocks", None)
+    old_num_ft_layers = getattr(args, "num_ft_layers", getattr(args, "num_ft_blocks", None))
     old_ranking_margin = getattr(args, "ranking_margin", None)
     old_ranking_margin_ties = getattr(args, "ranking_margin_ties", None)
-    old_attn_w = getattr(args, "attn_w", None)
+    # old_attn_w = getattr(args, "attn_w", None)
 
-    args.num_ft_blocks = int(cfg["num_ft_blocks"])
+    args.num_ft_layers = int(cfg["num_ft_layers"])
     args.ranking_margin = float(cfg["ranking_margin"])
-    args.attn_w = float(cfg["attn_w"][attn_mode])
+    # args.attn_w = float(cfg["attn_w"][attn_mode])
 
     # Keep ties margin synchronized when it was not explicitly set.
     if old_ranking_margin_ties is None:
@@ -286,16 +287,34 @@ def apply_backbone_hparam_overrides(args) -> None:
     args._backbone_override_info = {
         "backbone": backbone,
         "applied": True,
-        "old_num_ft_blocks": old_num_ft_blocks,
-        "new_num_ft_blocks": args.num_ft_blocks,
+        "old_num_ft_layers": old_num_ft_layers,
+        "new_num_ft_layers": args.num_ft_layers,
         "old_ranking_margin": old_ranking_margin,
         "new_ranking_margin": args.ranking_margin,
         "old_ranking_margin_ties": old_ranking_margin_ties,
         "new_ranking_margin_ties": getattr(args, "ranking_margin_ties", None),
-        "attention_mode": attn_mode,
-        "old_attn_w": old_attn_w,
-        "new_attn_w": getattr(args, "attn_w", None),
+        # "attention_mode": attn_mode,
+        # "old_attn_w": old_attn_w,
+        # "new_attn_w": getattr(args, "attn_w", None),
     }
+
+def normalize_finetune_layer_args(args) -> None:
+    """
+    Canonicalize the fine-tuning depth argument.
+
+    `num_ft_layers` is the current name. `num_ft_blocks` is accepted as a
+    legacy alias so old sweep files, W&B metadata, and shell commands still
+    replay correctly.
+    """
+    new_value = getattr(args, "num_ft_layers", None)
+    legacy_value = getattr(args, "num_ft_blocks", None)
+
+    if new_value is None:
+        new_value = 1 if legacy_value is None else legacy_value
+
+    args.num_ft_layers = int(new_value)
+    if hasattr(args, "num_ft_blocks"):
+        delattr(args, "num_ft_blocks")
     
 def _boolish_series_to_bool_mask(s: pd.Series) -> pd.Series:
     return s.astype(str).str.lower().str.strip().isin(["1", "true", "t", "yes", "y"])
@@ -787,6 +806,10 @@ def _build_transforms_and_specs(args):
             "compute_kl": bool(getattr(gaze_cfg, "compute_kl", False)),
             "use_kl_in_loss": bool(getattr(gaze_cfg, "use_kl_in_loss", False)),
             "need_attn_maps": bool(getattr(gaze_cfg, "need_attn_maps", False)),
+            "align_target": str(getattr(gaze_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))),
+            "attention_bias": bool(getattr(gaze_cfg, "attention_bias", False)),
+            "attention_bias_mode": str(getattr(args, "gaze_attention_bias", "none")),
+            "attention_bias_strength": float(getattr(args, "gaze_attention_bias_strength", 0.0)),
             "gaze_output": gaze_output,
             "grid_size": tuple(args.gaze_grid_size),
             "out_size": int(out_size),
@@ -850,8 +873,10 @@ def _build_model(args, backbone_model, is_cnn_backbone: bool) -> torch.nn.Module
     gaze_cfg = getattr(args, "gaze_cfg", None)
 
     need_attn_maps = bool(getattr(gaze_cfg, "need_attn_maps", False)) if gaze_cfg is not None else False
+    gaze_align_target = str(getattr(gaze_cfg, "align_target", getattr(args, "gaze_align_target", "attention"))).lower().strip() if gaze_cfg is not None else str(getattr(args, "gaze_align_target", "attention")).lower().strip()
     use_gaze_inj = bool(getattr(gaze_cfg, "inject", False)) if gaze_cfg is not None else False
     use_kl_in_loss = bool(getattr(gaze_cfg, "use_kl_in_loss", False)) if gaze_cfg is not None else False
+    use_gaze_attention_bias = bool(getattr(gaze_cfg, "attention_bias", False)) if gaze_cfg is not None else False
 
     gaze_grid = getattr(args, "gaze_grid_size", (14, 14))
     if isinstance(gaze_grid, (list, tuple)) and len(gaze_grid) == 2:
@@ -926,12 +951,16 @@ def _build_model(args, backbone_model, is_cnn_backbone: bool) -> torch.nn.Module
         pool_k=getattr(args, "pool_k", 10),
         num_classes=3 if args.ties else 2,
         finetune=args.finetune,
-        num_ft_blocks=args.num_ft_blocks,
+        num_ft_layers=args.num_ft_layers,
         rank_dropout=args.rank_dropout,
         cross_dropout=args.cross_dropout,
         use_attn_hook=bool(need_attn_maps),
         return_attn=bool(need_attn_maps),
         attention_mode=args.attention_mode,
+        gaze_align_target=gaze_align_target,
+        gaze_attention_bias=str(getattr(args, "gaze_attention_bias", "none")) if use_gaze_attention_bias else "none",
+        gaze_attention_bias_strength=float(getattr(args, "gaze_attention_bias_strength", 0.0)) if use_gaze_attention_bias else 0.0,
+        gaze_attention_bias_train_only=bool(getattr(args, "gaze_attention_bias_train_only", True)),
         attn_layer=int(getattr(args, "attn_layer", -1)),
         attn_out_hw=tuple(gaze_grid_hw),
         use_gaze_injection=bool(use_gaze_inj),
@@ -988,7 +1017,7 @@ def _cleanup_between_trials(args, net, train_loader, val_loader, test_loader) ->
     if args.cuda and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-def scale_lr_and_eta_min_by_unfrozen_blocks(
+def scale_lr_and_eta_min_by_unfrozen_layers(
     args,
     *,
     lr_01: float | None = None,
@@ -999,7 +1028,7 @@ def scale_lr_and_eta_min_by_unfrozen_blocks(
     base_lr = float(getattr(args, "base_lr", 0.0))
     eta_min = float(getattr(args, "eta_min", 0.0))
     finetune = bool(getattr(args, "finetune", False))
-    n = int(getattr(args, "num_ft_blocks", 0))
+    n = int(getattr(args, "num_ft_layers", getattr(args, "num_ft_blocks", 0)))
 
     if lr_01 is None:
         lr_01 = base_lr
@@ -1016,3 +1045,8 @@ def scale_lr_and_eta_min_by_unfrozen_blocks(
         new_eta = float(eta_other)
 
     return new_lr, new_eta
+
+
+def scale_lr_and_eta_min_by_unfrozen_blocks(*args, **kwargs):
+    """Deprecated compatibility wrapper; use scale_lr_and_eta_min_by_unfrozen_layers."""
+    return scale_lr_and_eta_min_by_unfrozen_layers(*args, **kwargs)
